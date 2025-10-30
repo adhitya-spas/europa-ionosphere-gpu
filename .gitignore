@@ -1,0 +1,12 @@
+# Ignore everything under img/ (but allow the directory itself and a .gitkeep file)
+/img/*
+!/img/.gitkeep
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Optional: editor/temp files (uncomment if desired)
+# .vscode/
+# *~
+# .DS_Store

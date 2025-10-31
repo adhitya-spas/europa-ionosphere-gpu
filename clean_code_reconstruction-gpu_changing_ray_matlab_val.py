@@ -1422,6 +1422,111 @@ def plot_peters_fig7_like(angles_deg, e_vec, TEC_err, out_png):
     fig.savefig(out_png, dpi=200, bbox_inches="tight")
     return fig, ax
 
+# ---------- Reconstruction-based θ–e surface ----------
+
+def make_eccentric_iono(alt_km_1d, Ne_1d, e, lat_extent=(-10,10), lat_res=200):
+    """
+    Build an ionosphere with a mild day/night asymmetry controlled by 'e' (0..~0.6).
+    We keep total TEC roughly stable by normalizing back to the base median.
+    """
+    lats, alt_km, alts_m, iono = step1_build_iono(alt_km_1d, Ne_1d, lat_extent, lat_res, add_gaussian=True)
+
+    # smooth latitudinal skew: scale(lat) = 1 + e * tanh(lat / L)
+    L = 4.0  # degrees; controls transition sharpness
+    scale_lat = 1.0 + e * np.tanh(lats / L)
+    iono_e = iono * scale_lat[np.newaxis, :]
+
+    # normalize so median TEC stays similar to base (optional but helps apples-to-apples)
+    base_med = np.median(iono)
+    new_med  = np.median(iono_e)
+    if new_med > 0:
+        iono_e *= (base_med / new_med)
+
+    return lats, alt_km, alts_m, iono_e
+
+
+def compute_angle_bins(theta_per_ray):
+    """Return sorted unique angles and an index list for each angle."""
+    th = np.asarray(theta_per_ray, float)
+    uniq = np.unique(th)
+    idxs = [np.where(th == u)[0] for u in uniq]
+    return uniq, idxs
+
+
+def recon_theta_e_surface(
+    alt_km_1d, Ne_1d,
+    rays_hf, theta_per_ray, integ_hf,
+    lats_base, alts_m_base,
+    e_vec=np.linspace(0.0, 0.6, 25),
+    n_iters=10, relax=0.15,
+    use_weighted=True,
+    out_png=None
+):
+    """
+    Build a θ–e heatmap where each cell is the mean absolute HF residual after reconstruction.
+    Residual = |(D·Ne_rec - V)|. Rows = eccentricity e, Cols = incidence angle θ.
+    """
+    # angles/bins from your HF geometry
+    theta_vals, angle_bins = compute_angle_bins(theta_per_ray)
+
+    # build D once from rays_hf & the lat/alt grid shape
+    D_vhf_dummy = sp.csr_matrix((0, len(lats_base)*len(alts_m_base)))  # not used, just to match existing builder
+    D_hf = build_geometry_matrix_weighted_sparse(rays_hf, lats_base, alts_m_base, dtype=np.float32)
+
+    heat = np.zeros((len(e_vec), len(theta_vals)), dtype=float)
+
+    for i, e in enumerate(e_vec):
+        # (1) ionosphere with eccentricity e
+        lats, alt_km, alts_m, iono_e = make_eccentric_iono(alt_km_1d, Ne_1d, e,
+                                                           lat_extent=(lats_base.min(), lats_base.max()),
+                                                           lat_res=len(lats_base))
+
+        # (2) forward model (GPU path if enabled)
+        tec_true, vtec_hf, delta_t_hf = step3_forward_model_gpu(
+            iono=iono_e, lats=lats, alts_m=alts_m,
+            D_hf=D_hf,
+            theta_per_ray=theta_per_ray,
+            integ_hf=integ_hf,
+            f_c_hf=F_C_HF, bw_hf=BW_HF
+        )
+
+        # (3) reconstruct (use your weighted ART that you already trust)
+        # build measurement vector 'y' for HF-only recon
+        y = vtec_hf.astype(np.float64)
+        if use_weighted:
+            # simple per-ray weights from your bandwidth/integration rule
+            w = calculate_measurement_weights(integ_hf, BW_HF)
+        else:
+            w = np.ones_like(y)
+
+        # reuse your helper with history disabled: few iterations for speed
+        Ne_rec = weighted_reconstruction_art_sparse(
+            D_hf, y, n_lat=len(lats), n_alt=len(alts_m),
+            n_iters=n_iters, relax=relax, weights=w
+        )
+
+        # (4) residuals per angle
+        yhat = (D_hf @ Ne_rec.ravel(order="C")).astype(np.float64)
+        r = np.abs(yhat - y)
+
+        for j, idx in enumerate(angle_bins):
+            if idx.size:
+                heat[i, j] = np.mean(r[idx])
+
+    # (5) plot
+    fig, ax = plt.subplots(figsize=(7.8, 5.6))
+    im = ax.pcolormesh(theta_vals, e_vec, heat, shading="auto", cmap="magma")
+    ax.set_xlabel("Incidence angle θ (deg from vertical)")
+    ax.set_ylabel("Eccentricity proxy e (day–night skew)")
+    ax.set_title("Reconstruction-derived mean |HF residual| (θ × e)")
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label("|Residual| (m$^{-2}$)")
+    fig.tight_layout()
+    if out_png:
+        fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    return theta_vals, e_vec, heat
+
+
 
 # ---------------------- δ(Δt) helper (optional) -----------------
 def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
@@ -1744,6 +1849,21 @@ def run_pipeline():
     dt_dTEC  = dt_error - dt_true
     VTEC_dTEC = (dt_dTEC*2*np.pi) * ((F_C_HF**2)*(F_C_VHF**2)) / (1.69e-6*((F_C_VHF**2)-(F_C_HF**2)))
     print(f"[Peters demo] dTEC={dTEC:.3e}, dt_true={dt_true:.3e}s, dt_error={dt_error:.3e}s, dt_dTEC={dt_dTEC:.3e}s, VTEC_dTEC={VTEC_dTEC:.3e}")
+
+    # Example call near the end of run_pipeline():
+    print("Building θ–e surface from reconstruction (quick sweep)…")
+    theta_vals, e_vals, heat = recon_theta_e_surface(
+        alt_km_1d, Ne_1d,
+        rays_hf=rays_hf,                 # reuse your current HF geometry
+        theta_per_ray=theta_per_ray,
+        integ_hf=integ_hf,
+        lats_base=lats,
+        alts_m_base=alts_m,
+        e_vec=np.linspace(0.0, 0.6, 15), # fewer rows for speed
+        n_iters=8, relax=0.15,
+        use_weighted=True,
+        out_png=os.path.join(IMG_DIR, "Z_recon_theta_e_surface.png")
+    )
 
 
     return {

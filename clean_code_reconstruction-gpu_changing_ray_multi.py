@@ -1901,4 +1901,3 @@ if __name__ == "__main__":
     else:
         # Single run with current global params
         results = run_pipeline()
-    # You can add any post-analysis you already do here (heatmaps, θ studies, etc.)

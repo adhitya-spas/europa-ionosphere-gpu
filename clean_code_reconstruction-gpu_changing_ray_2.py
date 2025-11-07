@@ -22,8 +22,6 @@ import scipy
 import scipy.sparse as sp 
 import os
 from datetime import datetime
-import gc
-
 from physics_constants import C_LIGHT, C_IONO, R_EUROPA
 
 from modify_df import load_mission_df
@@ -43,15 +41,6 @@ from improved_geometry import (
 )
 
 # ---------------------- Config -----------------------
-# Run different iterations in one
-RUN_MULTIPLE = True
-
-# --- Lightweight sweep controls ---
-PLOT_LEVEL = "essentials"   # "none" | "essentials" | "full"
-METRICS_ONLY = False         # if True: compute & save metrics, skip plots
-SAVE_METRICS_CSV = True
-METRICS_CSV_PATH = "img/_sweep_metrics.csv"
-
 # VHF & HF radio parameters (same conventions as your current main)
 F_C_VHF = 60e6        # VHF center frequency [Hz]
 BW_VHF  = 10e6        # VHF bandwidth [Hz]
@@ -62,7 +51,7 @@ BW_HF   = 1e6         # HF bandwidth [Hz]
 NPTS_VHF = 500        # samples along each VHF ray
 NPTS_HF  = 500        # samples along each HF ray (match VHF to keep ds small)
 SAT_LATS_VHF = np.linspace(-10.0, 10.0, 60)  #np.linspace(-10.0, -5.0, 10)  # ground-track latitudes for rays
-SAT_LATS_HF = np.linspace(-10, 8, 20)
+SAT_LATS_HF = np.linspace(-8, 8, 16)
 RAY_TRACE_MODE = "left_fixed"  # "left_fixed" or "sat_right" or "mirror"
 
 # HF true incidence angles (from vertical, 0° = nadir)
@@ -71,34 +60,39 @@ THETA_LIST_HF = np.linspace(1, 20, 20) # [-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,1,2,3,4
 
 # Integration times (seconds), per your current logic
 INTEG_TIMES_VHF = 0.12
-# INTEG_TIMES_HF_PER_ANGLE = np.array([0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14])
-INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)  # 20 values from 0.05s to 0.15s
+# Single HF integration time (scalar) — all HF rays use this T unless overridden
+INTEG_TIME_HF = 0.10  # seconds (single scalar)
+# legacy per-angle vector (deprecated) INTEG_TIMES_HF_PER_ANGLE — do not use
+# INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)
 
 # ART settings
 N_ITERS = 20
 RELAX   = 0.1
 
-# Note: use physics_constants for canonical values
-# C_LIGHT and C_IONO are imported from physics_constants
+# Use canonical physics constants from physics_constants
 
-if RUN_MULTIPLE:
-    # moved to reset_img_dir(); run_pipeline() will call it.
-    IMG_TS = None
-    IMG_DIR = None
-else:
-    # Create one timestamped folder per process start
-    IMG_TS = datetime.now().strftime("%m_%d_%H_%M_%S")
-    IMG_DIR = os.path.join("img", IMG_TS)
-    os.makedirs(IMG_DIR, exist_ok=True)
+# Create one timestamped folder per process start
+IMG_TS = datetime.now().strftime("%m_%d_%H_%M_%S")
+IMG_DIR = os.path.join("img", IMG_TS)
+os.makedirs(IMG_DIR, exist_ok=True)
 
 # Top-level smoothing toggle (0.0 = off)
 SMOOTH_SIGMA = 1.2
 
-LAT_EXTENT = (-10, 10)  
-LAT_RES    = 200       
-ADD_GAUSSIAN = True       
-
 TEST_CHECKS = False  # run unit test checks before main
+
+# --- Integration-time / satellite-track model selector ---------------
+# If True, we derive per-track SAT_LATS_HF spacing from the scalar INTEG_TIME_HF
+USE_GEOMETRIC_HF_SAT_LATS = False  # default: keep SAT_LATS_HF static
+
+# Geometric motion model parameters (km / km/s)
+V_KM_S = 5.0                        # spacecraft ground-track speed [km/s]
+H_KM   = 1500.0                     # satellite altitude [km]
+
+# Europa radius in km (for geometric conversions). physics_constants.R_EUROPA is meters.
+R_EUROPA_KM = R_EUROPA / 1e3
+
+
 # ---------------------- Step -1: GPU SUBSTITUTES ----------------------
 USE_GPU = True
 try:
@@ -151,10 +145,9 @@ def build_passive_plot_inputs_GPU(
     delta_tec_abs_gpu = cp.abs(stec_est_gpu - tec_true_gpu)
 
     # ---- 3B) δ(Δt) residual → TEC → VHF range error ----
-    # Use canonical constants on-device to avoid hard-coded literals
     c = cp.asarray(C_LIGHT, dtype=cp.float32)
-    f1_h = cp.asarray(F_C_HF - 0.5 * BW_HF, dtype=cp.float32)
-    f2_h = cp.asarray(F_C_HF + 0.5 * BW_HF, dtype=cp.float32)
+    f1_h = cp.asarray(F_C_HF - 0.5*BW_HF, dtype=cp.float32)
+    f2_h = cp.asarray(F_C_HF + 0.5*BW_HF, dtype=cp.float32)
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     # Match a single VHF Δt reference to all HF rays (same convention as your main)
@@ -164,9 +157,8 @@ def build_passive_plot_inputs_GPU(
     dt_vhf_match_gpu = cp.full_like(dt_hf_gpu, dt_vhf_gpu[vhf_idx])
     delta_dt_gpu = -(dt_vhf_match_gpu - dt_hf_gpu)
 
-    # Replace legacy K_IONO with C_IONO from physics_constants
-    tec_residual_gpu = (c * delta_dt_gpu / C_IONO) * freq_factor_h    # m^-2
-    range_err_gpu    = (C_IONO / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
+    tec_residual_gpu = (c * delta_dt_gpu / cp.asarray(C_IONO, dtype=cp.float32)) * freq_factor_h    # m^-2
+    range_err_gpu    = (cp.asarray(C_IONO, dtype=cp.float32) / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
 
     # ---- Return NumPy for plotting, keep GPU speed for compute ----
     t_meas      = cp.asnumpy(integ_gpu)
@@ -230,8 +222,8 @@ def step0_load_dataframe(path="new_mission_df.pkl", mission_name="E6a Exit"):
 
 # ---------------------- Step 1: Build ionosphere ----------------
 def step1_build_iono(alt_km_1d, Ne_1d,
-                     lat_extent=LAT_EXTENT, lat_res=LAT_RES,
-                     add_gaussian=ADD_GAUSSIAN):
+                     lat_extent=(-10, 10), lat_res=200,
+                     add_gaussian=True):
     # Build base map (extrude 1D profile to 2D)
     lats, alt_km, iono = build_ionosphere(
         pd.DataFrame({"altitude": alt_km_1d, "ne": Ne_1d}),
@@ -248,13 +240,59 @@ def step1_build_iono(alt_km_1d, Ne_1d,
             alt_center=150.0,
             lat_width=1.0,
             alt_width=20.0,
-            amplitude=5e11
+            amplitude=5e9
         )
 
     alts_m = alt_km * 1e3
     return lats, alt_km, alts_m, iono
 
 # ---------------------- Step 2: Generate rays -------------------
+def integration_time_from_angle(theta_deg, h_km=H_KM, v_km_s=V_KM_S):
+    """
+        Δt = (2 h tan θ) / v
+    θ is in degrees, h in km, v in km/s.
+    Returns Δt in seconds.
+    """
+    theta_rad = np.radians(theta_deg)
+    return (2.0 * h_km * np.tan(theta_rad)) / v_km_s
+
+def angle_from_integration_time(integ_time_s, h_km=H_KM, v_km_s=V_KM_S):
+    integ_time_s = np.asarray(integ_time_s, float)
+    theta_rad = np.arctan((v_km_s * integ_time_s) / (2.0 * h_km))
+    return np.degrees(theta_rad)
+
+
+def integration_time_from_angle(theta_deg, h_km=H_KM, v_km_s=V_KM_S):
+    """Return integration time [s] needed to observe a feature with incidence angle theta (deg).
+    Inverted geometric relation: T = 2*h*tan(theta)/v  (h and v in km, T in seconds).
+    """
+    theta_rad = np.radians(theta_deg)
+    return (2.0 * h_km * np.tan(theta_rad)) / v_km_s
+
+
+def build_sat_lats_from_scalar_time(lat_start_deg=-8.0, lat_end_deg=8.0,
+                                    v_km_s=V_KM_S, h_km=H_KM, R_E_km=R_EUROPA_KM, T=INTEG_TIME_HF):
+    """Build SAT_LATS spacing derived from spacecraft ground-track motion and scalar integration time T.
+    Returns an array of latitudes in degrees from lat_start_deg to lat_end_deg inclusive with step determined by
+    angular step = (v * T / (R+ h)) in radians -> degrees.
+    """
+    r_s = R_E_km + h_km
+    step_deg = (v_km_s * T / r_s) * (180.0 / np.pi)
+    # include endpoint safely
+    return np.arange(lat_start_deg, lat_end_deg + 0.5 * step_deg, step_deg)
+
+
+def theta_from_T(T, h_km=H_KM, v_km_s=V_KM_S):
+    """Return incidence angle (deg) corresponding to integration time T under geometric model."""
+    return np.degrees(np.arctan((v_km_s * T) / (2.0 * h_km)))
+
+
+def _percentiles(a):
+    a = np.asarray(a)
+    if a.size == 0:
+        return float('nan'), float('nan'), float('nan')
+    return float(np.percentile(a, 50)), float(np.percentile(a, 90)), float(np.percentile(a, 95))
+
 def step2_generate_rays(lats, alts_m):
     # 2A) VHF nadir rays
     rays_vhf = trace_passive_nadir(SAT_LATS_VHF, alts_m, npts=NPTS_VHF)
@@ -265,19 +303,27 @@ def step2_generate_rays(lats, alts_m):
     theta_per_ray = []
     integ_hf_all = []
 
-    T_PER_ANGLE = np.full(len(THETA_LIST_HF), 0.12, dtype=float)  # e.g. 0.12s
-    print(T_PER_ANGLE)
-    print(THETA_LIST_HF)
+    # Keep angle diversity: THETA_LIST_HF remains the explicit list defined in config
+    print(f"[INFO] Using THETA_LIST_HF with {len(THETA_LIST_HF)} angles")
 
+    # Build satellite ground-track latitudes for HF rays: either static or derived from INTEG_TIME_HF
+    if USE_GEOMETRIC_HF_SAT_LATS:
+        SAT_LATS_HF_dyn = build_sat_lats_from_scalar_time(lat_start_deg=float(SAT_LATS_HF[0]),
+                                                          lat_end_deg=float(SAT_LATS_HF[-1]),
+                                                          v_km_s=V_KM_S, h_km=H_KM,
+                                                          R_E_km=R_EUROPA_KM, T=INTEG_TIME_HF)
+        print(f"[INFO] Built dynamic SAT_LATS_HF from T={INTEG_TIME_HF}s: {len(SAT_LATS_HF_dyn)} tracks")
+    else:
+        SAT_LATS_HF_dyn = SAT_LATS_HF
 
     for idx, theta in enumerate(THETA_LIST_HF):
         rays_hf = trace_passive_oblique(
-            sat_lats=SAT_LATS_HF,
+            sat_lats=SAT_LATS_HF_dyn,
             h0_m=alts_m.max(),
             hsat_m=alts_m.max(),
             theta_i_deg=theta,
             npts=NPTS_HF,
-            R_E_m=1.5608e6,
+            R_E_m=R_EUROPA,
             mode=RAY_TRACE_MODE,
             lat_left_deg=0.0          # << choose your left start latitude
         )
@@ -289,8 +335,9 @@ def step2_generate_rays(lats, alts_m):
         #     npts=NPTS_HF
         # )
         rays_hf_all.extend(rays_hf)
-        theta_per_ray.extend([theta] * len(rays_hf))
-        integ_hf_all.extend([T_PER_ANGLE[idx]] * len(rays_hf))
+    theta_per_ray.extend([theta] * len(rays_hf))
+    # Broadcast single scalar INTEG_TIME_HF to every HF ray
+    integ_hf_all.extend([INTEG_TIME_HF] * len(rays_hf))
 
     theta_per_ray = np.array(theta_per_ray, dtype=float)
     integ_hf_all  = np.array(integ_hf_all, dtype=float)
@@ -326,8 +373,11 @@ def step2_generate_rays_gpu_sweep(
         theta_list_hf = [5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85]
     if sat_lats is None:
         sat_lats = np.linspace(-6.0, 6.0, 181)  # denser than 60 to broaden TEC coverage
+    # If no sweep provided, default to the single scalar INTEG_TIME_HF
     if t_sweep is None:
-        t_sweep = np.linspace(0.05, 0.15, 21)   # dense x-axis
+        t_sweep = np.array([INTEG_TIME_HF], float)
+    else:
+        t_sweep = np.atleast_1d(np.asarray(t_sweep, float))
 
     # ----- Build base geometry once (independent of T) -----
     rays_hf_base = []
@@ -358,10 +408,15 @@ def step2_generate_rays_gpu_sweep(
     integ_hf = []
 
     # ----- Replicate geometry across the T grid -----
+    # If dynamic SAT_LATS are requested, derive them from the first T value
+    if USE_GEOMETRIC_HF_SAT_LATS:
+        # for GPU sweep we keep geometry base built with provided sat_lats; optionally user can rebuild
+        pass
+
     for T in t_sweep:
         rays_hf.extend(rays_hf_base)
         theta_per_ray.extend(theta_base)
-        integ_hf.extend([T]*len(rays_hf_base))
+        integ_hf.extend([float(T)] * len(rays_hf_base))
 
     return rays_hf, np.asarray(theta_per_ray, float), np.asarray(integ_hf, float)
 
@@ -560,9 +615,7 @@ def plot_recons(lats, alts_m, recs, titles):
         if ax is axs[0]:
             ax.set_ylabel("Altitude (km)")
         fig.colorbar(im, ax=ax, label='Ne (×10⁶ cm⁻³)')
-    plt.tight_layout(); 
-    #plt.show(block=False); 
-    plt.savefig(os.path.join(IMG_DIR, "A_gpu_reconstructions.png"))
+    plt.tight_layout(); plt.show(block=False); plt.savefig(os.path.join(IMG_DIR, "A_gpu_reconstructions.png"))
 
 def plot_raypaths(lats, alts_m, rays_hf, theta_per_ray, rays_vhf,
                   title_hf="Modeled Raypaths (HF)",
@@ -649,7 +702,7 @@ def plot_raypaths(lats, alts_m, rays_hf, theta_per_ray, rays_vhf,
     ax_vhf.grid(False)
 
     plt.tight_layout()
-    #plt.show(block=False)
+    plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "B_gpu_raypaths.png"))
 
 def build_passive_plot_inputs(
@@ -692,6 +745,16 @@ def build_passive_plot_inputs(
     # Use canonical physics constants
     tec_residual_after_passive = (C_LIGHT * delta_dt / C_IONO) * freq_factor_h   # m^-2
     range_error_after_passive = (C_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
+
+    # Diagnostics: P50/P90/P95 for TEC error and range error
+    p50_tec, p90_tec, p95_tec = _percentiles(delta_tec_err_passive)
+    p50_rng, p90_rng, p95_rng = _percentiles(range_error_after_passive)
+    print(f"[PERC] |ΔTEC|: P50={p50_tec:.3e} P90={p90_tec:.3e} P95={p95_tec:.3e}")
+    print(f"[PERC] Δr (m): P50={p50_rng:.3e} P90={p90_rng:.3e} P95={p95_rng:.3e}")
+
+    # Minimum angular resolution implied by T=0.10s
+    theta_min = theta_from_T(0.10)
+    print(f"[CHECK] θ_min @ T=0.10s = {theta_min:.5f} deg")
 
     return t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive
 
@@ -750,7 +813,7 @@ def plot_passive_tec_error_heatmap_from_arrays(
     plt.title(title)
     plt.colorbar(label="ΔTEC Error (m$^{-2}$)")
     plt.tight_layout()
-    #plt.show(block=False)
+    plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "C_passive_tec_error_heatmap_from_arrays.png"))
 
 
@@ -803,7 +866,7 @@ def plot_vhf_range_error_heatmap_from_arrays(
     plt.title(title)
     plt.colorbar(label="Δr (meters)")
     plt.tight_layout()
-    #plt.show(block=False)
+    plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "D_vhf_range_error_heatmap.png"))
 
 
@@ -846,7 +909,7 @@ def plot_passive_tec_error_heatmap_GPU(
     plt.title(title)
     plt.colorbar(label="ΔTEC Error (m$^{-2}$)")
     plt.tight_layout()
-    #plt.show(block=False)
+    plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "C_gpu_hf_passive_tec_error_heatmap.png"))
 
 
@@ -887,7 +950,7 @@ def plot_vhf_range_error_heatmap_GPU(
     plt.title(title)
     plt.colorbar(label="Δr (meters)")
     plt.tight_layout()
-    #plt.show(block=False)
+    plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "D_gpu_vhf_range_error_heatmap.png"))
 
 
@@ -895,24 +958,12 @@ def _colcounts_to_grid(col_counts, n_alt, n_lat):
     """Reshape per-voxel column counts (length n_alt*n_lat) to (n_alt, n_lat) heatmap."""
     return np.asarray(col_counts, float).reshape(n_alt, n_lat, order="C")
 
-from matplotlib import colors as _mcolors
-
-def _imshow_lat_alt(img_alt_lat, lats, alts_m, title,
-                    cmap="viridis", cbar_label=None,
-                    vmin=None, vmax=None, norm=None, mask_zeros=False):
-    if mask_zeros:
-        import numpy as np
-        img_alt_lat = np.ma.masked_where(np.asarray(img_alt_lat) == 0, img_alt_lat)
-
+def _imshow_lat_alt(img_alt_lat, lats, alts_m, title, cmap="viridis", cbar_label=None, vmin=None, vmax=None):
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
-    im = ax.imshow(
-        img_alt_lat, origin="lower", aspect="auto",
-        extent=[float(lats.min()), float(lats.max()),
-                float(alts_m.min()/1e3), float(alts_m.max()/1e3)],
-        cmap=cmap, vmin=vmin, vmax=vmax, norm=norm
-    )
-    ax.set_xlabel("Latitude (deg)")
-    ax.set_ylabel("Altitude (km)")
+    im = ax.imshow(img_alt_lat, origin="lower", aspect="auto",
+                   extent=[lats.min(), lats.max(), alts_m.min()/1e3, alts_m.max()/1e3],
+                   cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_xlabel("Latitude (deg)"); ax.set_ylabel("Altitude (km)")
     ax.set_title(title)
     cbar = fig.colorbar(im, ax=ax)
     if cbar_label:
@@ -921,39 +972,20 @@ def _imshow_lat_alt(img_alt_lat, lats, alts_m, title,
     return fig, ax
 
 # 1) Ray coverage heatmap (per-voxel hit counts)
-# REPLACE the whole function with this
 def plot_ray_coverage_heatmap(D, lats, alts_m, title="Ray coverage (hits per voxel)"):
     """
     D: CSR geometry (n_rays x (n_alt*n_lat)).
     Shows, for each voxel, number of rays that intersect it.
     """
-    import numpy as np
     n_alt, n_lat = len(alts_m), len(lats)
-    if sp.issparse(D):
-        col_counts = D.getnnz(axis=0)
-    else:
-        col_counts = np.count_nonzero(D, axis=0)
-
+    col_counts = D.getnnz(axis=0) if sp.issparse(D) else np.count_nonzero(D, axis=0)
     grid = _colcounts_to_grid(col_counts, n_alt, n_lat)
-
-    # choose a robust vmax so a few very-hot voxels don't blow the scale
-    vmax = max(1.0, float(np.percentile(grid[grid > 0], 99))) if np.any(grid > 0) else 1.0
-    norm = colors.LogNorm(vmin=1, vmax=vmax)  # 1..vmax in log; zeros are masked
-
-    fig, ax = _imshow_lat_alt(
-        grid, lats, alts_m, title, cmap="magma",
-        cbar_label="# ray hits", norm=norm, mask_zeros=True
-    )
-
-    # DO NOT use log axes for lat/alt; they are linear physical coordinates
-    # ax.set_xscale("linear"); ax.set_yscale("linear")  # (default)
-    hits = D.getnnz(axis=0) if sp.issparse(D) else np.count_nonzero(D, axis=0)
-    print("coverage>0 voxels:", int((hits > 0).sum()), "of", hits.size,
-      "| max hits =", int(hits.max() if hits.size else 0))
-
-    fig.savefig(os.path.join(IMG_DIR, "E_ray_coverage_heatmap.png"), dpi=200, bbox_inches="tight")
+    fig, ax = _imshow_lat_alt(grid, lats, alts_m, title, cmap="magma", cbar_label="# ray hits")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(1e-17, 1e-13)
+    plt.savefig(os.path.join(IMG_DIR, "E_ray_coverage_heatmap.png"))
     return fig, ax
-
 
 # 2) Δt vs 1/f² check
 def plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, f_hf, f_vhf, title="|Δt| vs 1/f²"):
@@ -994,6 +1026,46 @@ def plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, f_hf, f_vhf, title="|Δt| vs 1/f²
     fig.tight_layout()
     fig.savefig(os.path.join(IMG_DIR, "E_dt_vs_invf2.png"), dpi=200, bbox_inches="tight")
     return fig, ax
+
+def plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, f_hf, f_vhf, title="|Δt| vs 1/f²"):
+    # x = 1/f^2 for each band (constant per band)
+    invf2_hf  = np.full_like(delta_t_hf,  1.0 / (f_hf**2),  dtype=float)
+    invf2_vhf = np.full_like(delta_t_vhf, 1.0 / (f_vhf**2), dtype=float)
+
+    y_hf  = np.abs(delta_t_hf)
+    y_vhf = np.abs(delta_t_vhf)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    ax.scatter(invf2_hf,  y_hf,  s=6,  alpha=0.4, label="HF")
+    ax.scatter(invf2_vhf, y_vhf, s=20, alpha=0.7, label="VHF", marker="x")
+
+    # log–log so both clusters are visible and trend is linear with slope ≈ 1
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+
+    # Nice bounds
+    x_all = np.concatenate([invf2_hf, invf2_vhf])
+    y_all = np.concatenate([y_hf, y_vhf])
+    ax.set_xlim(x_all.min()*0.8, x_all.max()*1.2)
+    ax.set_ylim(max(y_all.min()*0.8, 1e-12*np.max(y_all)), y_all.max()*1.2)
+
+    ax.set_xlabel("1 / f² (Hz⁻²)")
+    ax.set_ylabel("|Δt| (s)")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+
+    # Optional: draw a reference line with slope 1 through the HF median point
+    x0 = np.median(invf2_hf)
+    y0 = np.median(y_hf)
+    x_ref = np.array([x_all.min(), x_all.max()])
+    y_ref = y0 * (x_ref / x0)  # slope 1 in log–log means y ~ x
+    ax.plot(x_ref, y_ref, ls="--", lw=1.2, color="gray", label="_nolegend_")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(IMG_DIR, "E_dt_vs_invf2.png"), dpi=200, bbox_inches="tight")
+    return fig, ax
+
 
 # 3) VTEC recovery vs incidence angle (synthetic)
 def plot_vtec_recovery_vs_angle(vtec_true, angles_deg, f0, bw, T, dualfreq_to_VTEC, title="VTEC recovery vs angle (synthetic)"):
@@ -1389,134 +1461,52 @@ def centers_to_edges(c):
     e[-1]    = c[-1] + 0.5*(c[-1] - c[-2])
     return e
 
-# --------- helper to update globals and reset output dir ----------
-def update_params_and_outdir(tag=None, **overrides):
-    """
-    Usage:
-      update_params_and_outdir(tag="theta_5_80_16", THETA_LIST_HF=np.arange(5,85,5))
-      results = run_pipeline(tag="theta_5_80_16")
-    """
-    g = globals()
-    for k, v in overrides.items():
-        if k in g:
-            g[k] = v
-        else:
-            # allow new globals too (e.g., LAT_EXTENT/LAT_RES you just added)
-            g[k] = v
-    reset_img_dir(tag)
+# Print detailed electron-density statistics to validate reconstruction
+def _print_ne_stats(label: str, arr):
+    try:
+        a = np.asarray(arr)
+        if a.size == 0:
+            print(f"{label}: empty array")
+            return
+        # Flatten safety: expect 2D arrays (n_alt x n_lat)
+        mn = float(np.min(a))
+        mx = float(np.max(a))
+        mean = float(np.mean(a))
+        med = float(np.median(a))
+        p25 = float(np.percentile(a, 25))
+        p75 = float(np.percentile(a, 75))
 
-def reset_img_dir(tag=None):
-    global IMG_TS, IMG_DIR
-    ts = datetime.now().strftime("%m_%d_%H_%M_%S")
-    suffix = "" if not tag else f"_{tag}"
-    IMG_TS = ts + suffix
-    IMG_DIR = os.path.join("img", IMG_TS)
-    os.makedirs(IMG_DIR, exist_ok=True)
+        # Location of min/max (if 2D, map to alt/lat)
+        loc_min = None
+        loc_max = None
+        if a.ndim == 2 and 'lats' in locals() and 'alts_m' in locals():
+            i_min, j_min = np.unravel_index(int(np.argmin(a)), a.shape)
+            i_max, j_max = np.unravel_index(int(np.argmax(a)), a.shape)
+            lat_min = float(lats[j_min])
+            alt_min_m = float(alts_m[i_min])
+            lat_max = float(lats[j_max])
+            alt_max_m = float(alts_m[i_max])
+            loc_min = (i_min, j_min, alt_min_m, lat_min)
+            loc_max = (i_max, j_max, alt_max_m, lat_max)
 
-def compute_and_save_metrics(*, tag, iono_truth, Ne_rec_all, Ne_rec_weighted,
-                             D_hf, D_vhf, vtec_all, D_all, save_csv=True, csv_path=METRICS_CSV_PATH):
-    import numpy as np, pandas as pd, scipy.sparse as sp, os
-
-    def _rmse_resid(D, x, y):
-        r = (D @ x.ravel(order="C")) - y
-        return float(np.sqrt(np.mean(r**2))), float(np.mean(np.abs(r))), float(np.percentile(np.abs(r), 95))
-
-    # geometry stats
-    def _geom_stats(D):
-        if sp.issparse(D):
-            nzr = np.diff(D.indptr)
-            nnz = D.nnz
-        else:
-            nzr = np.count_nonzero(D, axis=1)
-            nnz = int(np.count_nonzero(D))
-        return {
-            "rows": D.shape[0],
-            "cols": D.shape[1],
-            "nnz": nnz,
-            "density": nnz / (D.shape[0]*D.shape[1]),
-            "nz_per_row_mean": float(np.mean(nzr)),
-            "nz_per_row_p95": float(np.percentile(nzr, 95)),
-        }
-
-    g_hf  = _geom_stats(D_hf)
-    g_vhf = _geom_stats(D_vhf)
-    g_all = _geom_stats(D_all)
-
-    # residual metrics
-    rmse_all, mae_all, p95_all = _rmse_resid(D_all, Ne_rec_all, vtec_all)
-    rmse_w,   mae_w,   p95_w   = _rmse_resid(D_all, Ne_rec_weighted, vtec_all)
-
-    # reconstruction quality vs truth
-    def _orient(A, shape):
-        n_alt, n_lat = shape
-        return A if A.shape == (n_alt, n_lat) else A.T
-
-    n_alt, n_lat = iono_truth.shape
-    rec_all = _orient(Ne_rec_all, (n_alt, n_lat))
-    rec_w   = _orient(Ne_rec_weighted, (n_alt, n_lat))
-
-    def _field_rmse(a, b):
-        return float(np.sqrt(np.mean((a - b)**2)))
-
-    def _ncc(a, b):
-        a0 = a - a.mean(); b0 = b - b.mean()
-        denom = np.linalg.norm(a0) * np.linalg.norm(b0)
-        return float((a0*b0).sum() / denom) if denom > 0 else 0.0
-
-    rmse_field_all = _field_rmse(rec_all, iono_truth)
-    rmse_field_w   = _field_rmse(rec_w,   iono_truth)
-    ncc_all        = _ncc(rec_all, iono_truth)
-    ncc_w          = _ncc(rec_w,   iono_truth)
-
-    row = {
-        "tag": tag,
-
-        # geometry
-        "hf_rows": g_hf["rows"], "hf_nnz": g_hf["nnz"], "hf_density": g_hf["density"],
-        "hf_nzrow_mean": g_hf["nz_per_row_mean"], "hf_nzrow_p95": g_hf["nz_per_row_p95"],
-        "vhf_rows": g_vhf["rows"], "vhf_nnz": g_vhf["nnz"], "vhf_density": g_vhf["density"],
-        "all_rows": g_all["rows"], "all_nnz": g_all["nnz"], "all_density": g_all["density"],
-
-        # residuals (data-fit)
-        "rmse_resid_all": rmse_all, "mae_resid_all": mae_all, "p95_resid_all": p95_all,
-        "rmse_resid_w":   rmse_w,   "mae_resid_w":   mae_w,   "p95_resid_w":   p95_w,
-
-        # field quality (vs truth)
-        "rmse_field_all": rmse_field_all, "rmse_field_w": rmse_field_w,
-        "ncc_all": ncc_all, "ncc_w": ncc_w,
-    }
-
-    if save_csv:
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-        # append-or-create
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        else:
-            df = pd.DataFrame([row])
-        df.to_csv(csv_path, index=False)
-
-    # also drop one JSON per run for reproducibility
-    import json
-    with open(os.path.join(IMG_DIR, "metrics.json"), "w") as f:
-        json.dump(row, f, indent=2)
-
-    return row
+        print(f"{label}: min={mn:.3e}, p25={p25:.3e}, med={med:.3e}, mean={mean:.3e}, p75={p75:.3e}, max={mx:.3e}")
+        if loc_min is not None and loc_max is not None:
+            print(
+                f"{label} location min idx=(alt_idx={loc_min[0]}, lat_idx={loc_min[1]}) alt={loc_min[2]:.1f} m lat={loc_min[3]:.3f}°, "
+                f"max idx=(alt_idx={loc_max[0]}, lat_idx={loc_max[1]}) alt={loc_max[2]:.1f} m lat={loc_max[3]:.3f}°"
+            )
+    except Exception as e:
+        print(f"{label}: <unavailable> (error: {e})")
 
 # ---------------------- Function calls ----------------------------
-def run_pipeline(tag=None):
-
-    # ensure a fresh output folder for each run
-    if IMG_DIR is None:
-        reset_img_dir(tag)
-
+def run_pipeline():
     # Step 0
     print("Step 0: Load Data")
     alt_km_1d, Ne_1d = step0_load_dataframe()
 
     # Step 1
     print("Step 1: Build Ionosphere")
-    lats, alt_km, alts_m, iono = step1_build_iono(alt_km_1d, Ne_1d)
+    lats, alt_km, alts_m, iono = step1_build_iono(alt_km_1d, Ne_1d, lat_extent=(-10, 10), lat_res=200)
 
     # Step 2
     print("Step 2: Generate Rays")
@@ -1528,7 +1518,7 @@ def run_pipeline(tag=None):
         theta_list_hf=THETA_LIST_HF,  # or your list
         sat_lats=SAT_LATS_HF,  # np.linspace(-6.0, 6.0, 181),   # denser tracks for richer TEC
         npts_hf=500,
-        t_sweep= INTEG_TIMES_HF_PER_ANGLE  # np.linspace(0.05, 0.15, 21)     # dense T grid (x-axis)
+        t_sweep= INTEG_TIME_HF #INTEG_TIMES_HF_PER_ANGLE  # np.linspace(0.05, 0.15, 21)     # dense T grid (x-axis)
         )
         rays_vhf = trace_passive_nadir(SAT_LATS_VHF, alts_m, npts=NPTS_VHF)
         integ_vhf = np.full(len(rays_vhf), INTEG_TIMES_VHF, dtype=float)
@@ -1644,10 +1634,8 @@ def run_pipeline(tag=None):
         rel  = rmse / max(float(np.mean(tec_true)), 1.0)
         print(f"[Step3] HF verticalization: RMSE={rmse:.3e} ({rel:.2%} of mean STEC)")
 
-    # Heavy diagnostic plots (only when doing a full visual run)
-    if not METRICS_ONLY and PLOT_LEVEL == "full":
-        plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, F_C_HF, F_C_VHF)
-        plot_vtec_recovery_vs_angle(vtec_true=5e14, angles_deg=np.arange(0,85,5), f0=F_C_HF, bw=BW_HF, T=1.0, dualfreq_to_VTEC=dualfreq_to_VTEC)
+    plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, F_C_HF, F_C_VHF)
+    plot_vtec_recovery_vs_angle(vtec_true=5e14, angles_deg=np.arange(0,85,5), f0=F_C_HF, bw=BW_HF, T=1.0, dualfreq_to_VTEC=dualfreq_to_VTEC)
 
     # Step 4
     print("Step 4: Build Geometry Matrices")
@@ -1674,10 +1662,8 @@ def run_pipeline(tag=None):
         print(f"[Step4] densities: HF={D_hf.nnz/(D_hf.shape[0]*D_hf.shape[1]):.6f}, "
             f"VHF={D_vhf.nnz/(D_vhf.shape[0]*D_vhf.shape[1]):.6f}")
 
-    # Quick coverage maps are essentials-level plots
-    if not METRICS_ONLY and PLOT_LEVEL in ("essentials", "full"):
-        plot_ray_coverage_heatmap(D_hf, lats, alts_m, "HF ray coverage")
-        plot_ray_coverage_heatmap(D_vhf, lats, alts_m, "VHF ray coverage")
+    plot_ray_coverage_heatmap(D_hf, lats, alts_m, "HF ray coverage")
+    plot_ray_coverage_heatmap(D_vhf, lats, alts_m, "VHF ray coverage")
 
     # Step 5A (ARTs) + collect for weighted
     print("Step 5: Reconstruct")
@@ -1706,16 +1692,17 @@ def run_pipeline(tag=None):
         n_lat=len(lats), n_alt=len(alts_m), n_iters=50, relax=0.2
     )
 
-    # --- Post-solve global gain correction ---
-    y_pred = D_all @ Ne_rec_weighted.ravel(order="C")   # predicted slant TEC
-    denom  = float(y_pred @ y_pred) if (y_pred is not None) else 0.0
-    if denom > 0:
-        gain = float(y_pred @ vtec_all) / denom         # LS scalar
-        Ne_rec_weighted *= gain
-        print(f"[GAIN] Applied global scale = {gain:.3e}")
-    else:
-        print("[GAIN] skipped (zero denominator)")
-
+    # Original ionosphere
+    _print_ne_stats("Original Ne (iono)", iono if 'iono' in locals() else np.array([]))
+    # Reconstructed (unweighted ART)
+    _print_ne_stats("Reconstructed Ne (ART all)", Ne_rec_all if 'Ne_rec_all' in locals() else np.array([]))
+    # Reconstructed (weighted ART)
+    _print_ne_stats("Reconstructed Ne (weighted)", Ne_rec_weighted if 'Ne_rec_weighted' in locals() else np.array([]))
+    # Optional: per-branch reconstructions if available
+    if 'Ne_rec_vhf' in locals():
+        _print_ne_stats("Reconstructed Ne (VHF ART)", Ne_rec_vhf)
+    if 'Ne_rec_hf' in locals():
+        _print_ne_stats("Reconstructed Ne (HF ART)", Ne_rec_hf)
 
     Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
         D_all, vtec_all, weights,
@@ -1723,13 +1710,9 @@ def run_pipeline(tag=None):
         n_iters=N_ITERS, relax=RELAX,
         compute_lcurve=True, L=None
     )
-
-    # RMSE is a fast, essential diagnostic
-    if not METRICS_ONLY and PLOT_LEVEL in ("essentials", "full"):
-        plot_rmse_vs_iteration(rmse_hist_unw, rmse_hist_w)
-
-    # L-curves are heavier / optional
-    if not METRICS_ONLY and PLOT_LEVEL == "full" and reg_hist_unw is not None and reg_hist_w is not None:
+    plot_rmse_vs_iteration(rmse_hist_unw, rmse_hist_w)
+    if reg_hist_unw is not None and reg_hist_w is not None:
+        # You can plot both on the same axes by calling twice, or make two panels
         plot_lcurve(norm_residual=rmse_hist_unw, norm_regularizer=reg_hist_unw, title="L-curve (unweighted)")
         plot_lcurve(norm_residual=rmse_hist_w,  norm_regularizer=reg_hist_w,  title="L-curve (weighted)")
 
@@ -1738,43 +1721,32 @@ def run_pipeline(tag=None):
                                  f_c_hf=F_C_HF, bw_hf=BW_HF,
                                  n_iters=N_ITERS, relax=RELAX)
                                  
-    # Residual diagnostics are essential for sweeps
-    if not METRICS_ONLY and PLOT_LEVEL in ("essentials", "full"):
-        fig, ax, r_all, r_w = plot_residual_histograms(D_all, vtec_all, Ne_rec_all, Ne_rec_weighted)
-        plot_residuals_vs_angle_time(D_all, vtec_all, D_vhf, theta_per_ray, integ_hf, Ne_rec_all)
-    else:
-        # keep variable names defined for downstream code even if plots skipped
-        fig = ax = None; r_all = r_w = None
+    fig, ax, r_all, r_w = plot_residual_histograms(D_all, vtec_all, Ne_rec_all, Ne_rec_weighted)
+    plot_residuals_vs_angle_time(D_all, vtec_all, D_vhf, theta_per_ray, integ_hf, Ne_rec_all)
 
     # Ensure arrays are (n_alt, n_lat) for cross-sections (transpose if yours are (n_lat,n_alt))
     truth_alt_lat = iono
     rec_all_alt_lat = Ne_rec_all
     rec_w_alt_lat   = Ne_rec_weighted
-    # Cross-sections are essential; uncertainty proxy is heavier
-    if not METRICS_ONLY and PLOT_LEVEL in ("essentials", "full"):
-        plot_recon_cross_sections(lats, alts_m, iono.T, Ne_rec_all, Ne_rec_weighted)
-
-    if not METRICS_ONLY and PLOT_LEVEL == "full":
-        plot_voxel_uncertainty_proxy(D_all, lats, alts_m)
+    plot_recon_cross_sections(lats, alts_m, iono.T, Ne_rec_all, Ne_rec_weighted)
+    plot_voxel_uncertainty_proxy(D_all, lats, alts_m)
 
     # Step 6 (plots)
     print("Step 6: Plotting & Evaluation")
-    # Final summary visuals are heavy / full-only
-    if not METRICS_ONLY and PLOT_LEVEL == "full":
-        plot_recons(
-            lats, alts_m,
-            [Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, Ne_rec_weighted, Ne_rec_ddt],
-            ["VHF only", "HF only", "Combined (standard)", "Combined (weighted)", "δ(Δt)-based"]
-        )
-        plot_raypaths(
-            lats=lats,
-            alts_m=alts_m,
-            rays_hf=rays_hf,
-            theta_per_ray=theta_per_ray,
-            rays_vhf=rays_vhf,
-            # optional: limit lines per angle to reduce clutter
-            # max_rays_per_angle=60,
-        )
+    plot_recons(
+        lats, alts_m,
+        [Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, Ne_rec_weighted, Ne_rec_ddt],
+        ["VHF only", "HF only", "Combined (standard)", "Combined (weighted)", "δ(Δt)-based"]
+    )
+    plot_raypaths(
+    lats=lats,
+    alts_m=alts_m,
+    rays_hf=rays_hf,
+    theta_per_ray=theta_per_ray,
+    rays_vhf=rays_vhf,
+    # optional: limit lines per angle to reduce clutter
+    # max_rays_per_angle=60,
+    )
 
     if not USE_GPU:
         t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive = build_passive_plot_inputs(
@@ -1786,10 +1758,9 @@ def run_pipeline(tag=None):
             delta_t_hf=delta_t_hf,
             delta_t_vhf=delta_t_vhf,
         )
-        # Then make the two figures (heavy — full only)
-        if not METRICS_ONLY and PLOT_LEVEL == "full":
-            plot_passive_tec_error_heatmap_from_arrays(t_meas, tec_for_bin, delta_tec_err_passive, smooth_sigma=1.2)
-            plot_vhf_range_error_heatmap_from_arrays(t_meas, tec_for_bin, range_error_after_passive, smooth_sigma=1.2)
+        # Then make the two figures
+        plot_passive_tec_error_heatmap_from_arrays(t_meas, tec_for_bin, delta_tec_err_passive, smooth_sigma=1.2)
+        plot_vhf_range_error_heatmap_from_arrays(t_meas, tec_for_bin, range_error_after_passive, smooth_sigma=1.2)
 
     else:
         t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive = build_passive_plot_inputs_GPU(
@@ -1803,18 +1774,8 @@ def run_pipeline(tag=None):
             sat_lats_vhf=SAT_LATS_VHF,
             hf_origin_lat=float(SAT_LATS_HF[0]),
         )
-        if not METRICS_ONLY and PLOT_LEVEL == "full":
-            plot_passive_tec_error_heatmap_GPU(t_meas, tec_for_bin, delta_tec_err_passive, smooth_sigma=1.2)
-            plot_vhf_range_error_heatmap_GPU(t_meas, tec_for_bin, range_error_after_passive, smooth_sigma=1.2)
-
-    compute_and_save_metrics(
-    tag=IMG_TS,
-    iono_truth=iono if iono.shape == Ne_rec_all.shape else iono.T,
-    Ne_rec_all=Ne_rec_all,
-    Ne_rec_weighted=Ne_rec_weighted,
-    D_hf=D_hf, D_vhf=D_vhf, vtec_all=vtec_all, D_all=D_all,
-    save_csv=SAVE_METRICS_CSV, csv_path=METRICS_CSV_PATH
-    )
+        plot_passive_tec_error_heatmap_GPU(t_meas, tec_for_bin, delta_tec_err_passive, smooth_sigma=1.2)
+        plot_vhf_range_error_heatmap_GPU(t_meas, tec_for_bin, range_error_after_passive, smooth_sigma=1.2)
 
 
     return {
@@ -1840,273 +1801,8 @@ def run_pipeline(tag=None):
         "vtec_all": vtec_all,
     }
 
-
-
-def clear_up_cache():
-    # Force figure and variable cleanup
-    plt.close('all')
-    del results
-    gc.collect()
-
-    # Clear GPU memory pools if CuPy is present
-    if cp is not None:
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-        except Exception:
-            pass
-
-def compute_and_save_peak_metrics(results, tag, csv_path="img/_peak_metrics.csv"):
-    """
-    Logs how well the reconstruction recovers the peak (max) electron density:
-      - absolute & relative peak Ne error
-      - altitude/latitude of the recovered peak vs truth
-    """
-    import numpy as np, pandas as pd, os
-
-    iono_truth = results["iono"]            # (n_alt, n_lat) in your code
-    rec_w      = results["Ne_rec_weighted"] # may be (n_alt, n_lat) already
-
-    # orient if needed
-    if rec_w.shape != iono_truth.shape:
-        rec_w = rec_w.T
-
-    Ne_true_max = float(np.nanmax(iono_truth))
-    Ne_rec_max  = float(np.nanmax(rec_w))
-
-    peak_err_abs = abs(Ne_rec_max - Ne_true_max)
-    peak_err_rel = peak_err_abs / Ne_true_max if Ne_true_max != 0 else np.nan
-
-    alts_km = results["alts_m"] / 1e3
-    lats    = results["lats"]
-
-    idx_true = np.unravel_index(np.nanargmax(iono_truth), iono_truth.shape)
-    idx_rec  = np.unravel_index(np.nanargmax(rec_w),      rec_w.shape)
-    alt_true_km, lat_true_deg = float(alts_km[idx_true[0]]), float(lats[idx_true[1]])
-    alt_rec_km,  lat_rec_deg  = float(alts_km[idx_rec[0]]),  float(lats[idx_rec[1]])
-
-    row = dict(
-        tag=tag,
-        Ne_true_max=Ne_true_max,
-        Ne_rec_max=Ne_rec_max,
-        peak_err_abs=peak_err_abs,
-        peak_err_rel=peak_err_rel,
-        alt_true_km=alt_true_km,
-        alt_rec_km=alt_rec_km,
-        lat_true_deg=lat_true_deg,
-        lat_rec_deg=lat_rec_deg,
-    )
-
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([row])
-    df.to_csv(csv_path, index=False)
-
-    print(f"[PEAK] {tag}: rel_err={peak_err_rel:.2%} | Ne_true_max={Ne_true_max:.3e} | Ne_rec_max={Ne_rec_max:.3e} | "
-          f"alt(rec,true)=({alt_rec_km:.1f},{alt_true_km:.1f}) km | lat(rec,true)=({lat_rec_deg:.1f},{lat_true_deg:.1f})°")
-
-def clear_after_run(results=None):
-    """Free figures, CPU GC, and CuPy pools between runs."""
-    import matplotlib.pyplot as plt, gc
-    plt.close('all')
-    if results is not None:
-        del results
-    gc.collect()
-    if cp is not None:
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-        except Exception:
-            pass
-
-def plot_peak_trends(csv_path="img/_peak_metrics.csv", outdir=None):
-    import re, os
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-
-    if outdir is None:
-        outdir = os.path.join("img", "peak_trends")
-    os.makedirs(outdir, exist_ok=True)
-
-    df = pd.read_csv(csv_path)
-
-    # Parse tag like: minAngle_ang_5-60_12__T_0.10s
-    lo_list, hi_list, n_list, T_list = [], [], [], []
-    for t in df["tag"].astype(str).tolist():
-        m = re.search(r"ang_(\d+)-(\d+)_([0-9]+)__T_([0-9.]+)s", t)
-        if m:
-            lo, hi, n, T = int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))
-        else:
-            lo = hi = n = None; T = np.nan
-        lo_list.append(lo); hi_list.append(hi); n_list.append(n); T_list.append(T)
-
-    df["ang_lo"]   = lo_list
-    df["ang_hi"]   = hi_list
-    df["ang_span"] = df["ang_hi"] - df["ang_lo"]
-    df["ang_count"]= n_list
-    df["T"]        = T_list
-
-    # Keep only rows we parsed
-    df = df.dropna(subset=["T", "ang_span"]).copy()
-
-    # Sort for cleaner lines
-    df = df.sort_values(["T", "ang_span"])
-
-    # -------------- HEATMAP: peak_err_rel over span × T --------------
-    piv = df.pivot_table(index="T", columns="ang_span", values="peak_err_rel", aggfunc="median")
-    plt.figure(figsize=(7.2, 4.8))
-    im = plt.imshow(piv.values, origin="lower", aspect="auto",
-                    extent=[piv.columns.min(), piv.columns.max(), piv.index.min(), piv.index.max()])
-    plt.colorbar(im, label="peak_err_rel (fraction)")
-    plt.xlabel("Angle span (deg)  [hi − lo]")
-    plt.ylabel("Single integration time T (s)")
-    plt.title("Peak Ne relative error vs angle span and T")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "peak_err_rel_heatmap.png"), dpi=200)
-    plt.close()
-
-    # -------------- LINES: Ne_rec_max vs span, per T --------------
-    plt.figure(figsize=(7.6, 4.6))
-    for T, g in df.groupby("T"):
-        plt.plot(g["ang_span"], g["Ne_rec_max"], marker="o", label=f"T={T:.2f}s")
-    plt.xlabel("Angle span (deg)  [hi − lo]")
-    plt.ylabel("Recovered max Ne (m$^{-3}$)")
-    plt.title("Max Ne vs angle span (curves by T)")
-    plt.grid(True, alpha=0.3)
-    plt.legend(ncol=2, fontsize=9)
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "Ne_rec_max_vs_span_by_T.png"), dpi=200)
-    plt.close()
-
-    # -------------- LINES: peak_err_rel vs span, per T --------------
-    plt.figure(figsize=(7.6, 4.6))
-    for T, g in df.groupby("T"):
-        plt.plot(g["ang_span"], g["peak_err_rel"], marker="o", label=f"T={T:.2f}s")
-    plt.xlabel("Angle span (deg)  [hi − lo]")
-    plt.ylabel("Peak Ne relative error")
-    plt.title("Peak Ne error vs angle span (curves by T)")
-    plt.grid(True, alpha=0.3)
-    plt.legend(ncol=2, fontsize=9)
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "peak_err_rel_vs_span_by_T.png"), dpi=200)
-    plt.close()
-
-    print(f"[plot_peak_trends] Wrote plots to: {outdir}")
-
-
-
-
 # ---------------------- Entry point -----------------------------
 if __name__ == "__main__":
 
-    if RUN_MULTIPLE:
-        # (A) Define angle ranges to test (deg from vertical)
-        angle_spans_deg = [35] #[15, 25, 35, 45, 55, 65, 75] 
-        angle_low_anchors = [1] #[1, 5, 10]                      
-
-        angle_ranges = []
-        for lo in angle_low_anchors:
-            for span in angle_spans_deg:
-                hi = lo + span
-                if hi <= 85:
-                    angle_ranges.append(np.arange(lo, hi+1, 5))
-
-        print(f"Defined {len(angle_ranges)} angle ranges for sweeps.")
-        print("Angle ranges (deg):")
-        for ang in angle_ranges:
-            print(" ", ang)
-
-        # (B) Define single integration times (seconds) to sweep
-        single_T_values = [0.03, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25] # [0.1]
-
-        # (C) Optional: run headless/fast for sweeps
-        PLOT_LEVEL   = "essentials"        # "none" | "essentials" | "full"
-        METRICS_ONLY = True          # compute metrics, skip figures
-
-        for ang in angle_ranges:
-            for T in single_T_values:
-                # IMPORTANT: to avoid geometry replication, pass a 1-element array for T
-                # so step2_generate_rays_gpu_sweep does a single pass (no duplication).
-                t_sweep = np.array([T], dtype=float)
-
-                tag = f"minAngle_ang_{int(ang[0])}-{int(ang[-1])}_{len(ang)}__T_{T:.2f}s"
-
-                print(f"\n=== Running: {tag} ===")
-                update_params_and_outdir(
-                    tag=tag,
-                    THETA_LIST_HF=ang,
-                    INTEG_TIMES_HF_PER_ANGLE=t_sweep
-                )
-                results = run_pipeline(tag=IMG_TS)
-
-                # Peak-Ne accuracy logger (writes img/_peak_metrics.csv)
-                compute_and_save_peak_metrics(results, tag)
-
-                # Memory hygiene between runs
-                clear_after_run(results)
-
-        plot_peak_trends("img/_peak_metrics.csv")
-                
-        # # 1) vary HF incidence angles
-        # for th_list in [np.linspace(1,20,20), np.arange(5,85,5), np.linspace(10,80,8)]:
-        #     print(f"\n=== (1) Running angle sweep: {th_list} ===")
-        #     update_params_and_outdir(
-        #         tag=f"theta_{int(th_list[0])}_{int(th_list[-1])}_{len(th_list)}",
-        #         THETA_LIST_HF=th_list
-        #     )
-        #     results = run_pipeline(tag=IMG_TS)  # pass the same tag so plots land in this folder
-        #     clear_up_cache()
-
-        # # 2) vary HF integration-time sweep
-        # for t_sweep in [np.linspace(0.05,0.15,21), np.linspace(0.02,0.20,37)]:
-        #     print(f"\n=== (2) Running time sweep: {t_sweep} ===")
-        #     update_params_and_outdir(
-        #         tag=f"T_{t_sweep[0]:.2f}_{t_sweep[-1]:.2f}_{len(t_sweep)}",
-        #         INTEG_TIMES_HF_PER_ANGLE=t_sweep
-        #     )
-        #     results = run_pipeline(tag=IMG_TS)
-        #     clear_up_cache()
-
-        # # 3) vary HF ground tracks (density of SAT_LATS_HF)
-        # for n in [16, 41, 81, 161]:
-        #     print(f"\n=== (3) Running HF ground track density: {n} tracks ===")
-        #     sat_lats = np.linspace(-8, 8, n)
-        #     update_params_and_outdir(tag=f"hftracks_{n}", SAT_LATS_HF=sat_lats)
-        #     results = run_pipeline(tag=IMG_TS)
-        #     clear_up_cache()
-
-        # # 4) vary grid resolution / extent (reconstruction footprint)
-        # for lat_res in [100, 200, 300, 400]:
-        #     print(f"\n=== (4) Running grid resolution sweep: {lat_res} ===")
-        #     update_params_and_outdir(tag=f"grid_res_{lat_res}", LAT_RES=lat_res)
-        #     results = run_pipeline(tag=IMG_TS)
-        #     clear_up_cache()
-
-        # for extent in [(-6,6), (-8,8), (-10,10), (-12,12)]:
-        #     print(f"\n=== (4) Running grid extent sweep: {extent} ===")
-        #     update_params_and_outdir(tag=f"grid_extent_{extent[0]}_{extent[1]}", LAT_EXTENT=extent)
-        #     results = run_pipeline(tag=IMG_TS)
-        #     clear_up_cache()
-
-        # # 5) combined angle + time sweeps
-        # angle_sets = [np.arange(5,85,5), np.linspace(10,70,13)]
-        # time_sets  = [np.linspace(0.05,0.15,21), np.linspace(0.03,0.18,31)]
-
-        # for th_list in angle_sets:
-        #     print(f"\n=== (5) Running angle sweep: {th_list} ===")
-        #     for t_sweep in time_sets:
-        #         print(f"\n===   with time sweep: {t_sweep} ===")
-        #         tag = f"th_{int(th_list[0])}-{int(th_list[-1])}_{len(th_list)}__T_{t_sweep[0]:.2f}-{t_sweep[-1]:.2f}_{len(t_sweep)}"
-        #         update_params_and_outdir(tag=tag, THETA_LIST_HF=th_list, INTEG_TIMES_HF_PER_ANGLE=t_sweep)
-        #         results = run_pipeline(tag=IMG_TS)
-        #         clear_up_cache()
-
-
-
-    else:
-        # Single run with current global params
-        results = run_pipeline()
+    results = run_pipeline()
+    # You can add any post-analysis you already do here (heatmaps, θ studies, etc.)

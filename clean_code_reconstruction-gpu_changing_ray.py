@@ -22,6 +22,7 @@ import scipy
 import scipy.sparse as sp 
 import os
 from datetime import datetime
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
 
 from modify_df import load_mission_df
 from ionosphere_design import (
@@ -60,15 +61,13 @@ THETA_LIST_HF = np.linspace(1, 20, 20) # [-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,1,2,3,4
 # Integration times (seconds), per your current logic
 INTEG_TIMES_VHF = 0.12
 # INTEG_TIMES_HF_PER_ANGLE = np.array([0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14])
-INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)  # 20 values from 0.05s to 0.15s
+INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)  # 100 values from 0.05s to 0.15s
 
 # ART settings
 N_ITERS = 20
 RELAX   = 0.1
 
-# Some constants
-C = 3e8  # speed of light [m/s]
-K_IONO = 40.3  # ionospheric delay constant in SI: Δt = K_IONO * TEC / (c f^2)
+# Use canonical physics constants from physics_constants
 
 # Create one timestamped folder per process start
 IMG_TS = datetime.now().strftime("%m_%d_%H_%M_%S")
@@ -79,6 +78,14 @@ os.makedirs(IMG_DIR, exist_ok=True)
 SMOOTH_SIGMA = 1.2
 
 TEST_CHECKS = False  # run unit test checks before main
+
+# --- Integration-time model selector ---------------------------------
+USE_GEOMETRIC_INTEG_TIME = True     # True -  for geometric model; False - constant time
+USE_GEOMETRIC_HF_SAT_LATS = True
+H_KM   = 1500.0                     # km
+V_KM_S = 5.0                        # km/s
+
+
 # ---------------------- Step -1: GPU SUBSTITUTES ----------------------
 USE_GPU = True
 try:
@@ -131,7 +138,7 @@ def build_passive_plot_inputs_GPU(
     delta_tec_abs_gpu = cp.abs(stec_est_gpu - tec_true_gpu)
 
     # ---- 3B) δ(Δt) residual → TEC → VHF range error ----
-    c = cp.asarray(3e8, dtype=cp.float32)
+    c = cp.asarray(C_LIGHT, dtype=cp.float32)
     f1_h = cp.asarray(F_C_HF - 0.5*BW_HF, dtype=cp.float32)
     f2_h = cp.asarray(F_C_HF + 0.5*BW_HF, dtype=cp.float32)
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
@@ -143,8 +150,8 @@ def build_passive_plot_inputs_GPU(
     dt_vhf_match_gpu = cp.full_like(dt_hf_gpu, dt_vhf_gpu[vhf_idx])
     delta_dt_gpu = -(dt_vhf_match_gpu - dt_hf_gpu)
 
-    tec_residual_gpu = (c * delta_dt_gpu / K_IONO) * freq_factor_h    # m^-2
-    range_err_gpu    = (K_IONO / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
+    tec_residual_gpu = (c * delta_dt_gpu / cp.asarray(C_IONO, dtype=cp.float32)) * freq_factor_h    # m^-2
+    range_err_gpu    = (cp.asarray(C_IONO, dtype=cp.float32) / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
 
     # ---- Return NumPy for plotting, keep GPU speed for compute ----
     t_meas      = cp.asnumpy(integ_gpu)
@@ -226,13 +233,27 @@ def step1_build_iono(alt_km_1d, Ne_1d,
             alt_center=150.0,
             lat_width=1.0,
             alt_width=20.0,
-            amplitude=5e11
+            amplitude=5e9
         )
 
     alts_m = alt_km * 1e3
     return lats, alt_km, alts_m, iono
 
 # ---------------------- Step 2: Generate rays -------------------
+def integration_time_from_angle(theta_deg, h_km=H_KM, v_km_s=V_KM_S):
+    """
+        Δt = (2 h tan θ) / v
+    θ is in degrees, h in km, v in km/s.
+    Returns Δt in seconds.
+    """
+    theta_rad = np.radians(theta_deg)
+    return (2.0 * h_km * np.tan(theta_rad)) / v_km_s
+
+def angle_from_integration_time(integ_time_s, h_km=H_KM, v_km_s=V_KM_S):
+    integ_time_s = np.asarray(integ_time_s, float)
+    theta_rad = np.arctan((v_km_s * integ_time_s) / (2.0 * h_km))
+    return np.degrees(theta_rad)
+
 def step2_generate_rays(lats, alts_m):
     # 2A) VHF nadir rays
     rays_vhf = trace_passive_nadir(SAT_LATS_VHF, alts_m, npts=NPTS_VHF)
@@ -243,10 +264,22 @@ def step2_generate_rays(lats, alts_m):
     theta_per_ray = []
     integ_hf_all = []
 
-    T_PER_ANGLE = np.full(len(THETA_LIST_HF), 0.12, dtype=float)  # e.g. 0.12s
-    print(T_PER_ANGLE)
-    print(THETA_LIST_HF)
+    if USE_GEOMETRIC_INTEG_TIME:
+        # Geometric relation: Δt = (2 h tan θ)/v
+        THETA_LIST_HF = angle_from_integration_time(INTEG_TIMES_HF_PER_ANGLE)
+        print("[INFO] Using geometric model:")
+        print(np.round(THETA_LIST_HF, 3))
+    else:
+        # Manual list or sweep definition
+        THETA_LIST_HF = THETA_LIST_HF
+        print("[INFO] Using predefined integration times")
 
+    if USE_GEOMETRIC_HF_SAT_LATS:
+        r_s = R_EUROPA + H_KM
+        linear_dist = (V_KM_S*INTEG_TIMES_HF_PER_ANGLE)*(180/(np.pi*r_s))
+        SAT_LATS_HF = np.arange(SAT_LATS_HF[0], SAT_LATS_HF[-1], linear_dist)
+    else:
+        SAT_LATS_HF = SAT_LATS_HF
 
     for idx, theta in enumerate(THETA_LIST_HF):
         rays_hf = trace_passive_oblique(
@@ -306,6 +339,23 @@ def step2_generate_rays_gpu_sweep(
         sat_lats = np.linspace(-6.0, 6.0, 181)  # denser than 60 to broaden TEC coverage
     if t_sweep is None:
         t_sweep = np.linspace(0.05, 0.15, 21)   # dense x-axis
+
+    if USE_GEOMETRIC_INTEG_TIME:
+        # Geometric relation: Δt = (2 h tan θ)/v
+        theta_list_hf = angle_from_integration_time(INTEG_TIMES_HF_PER_ANGLE)
+        print("[INFO] Using geometric model:")
+        print(np.round(theta_list_hf, 3))
+    else:
+        # Manual list or sweep definition
+        theta_list_hf = theta_list_hf
+        print("[INFO] Using predefined integration times")
+
+    if USE_GEOMETRIC_HF_SAT_LATS:
+        r_s = R_EUROPA + H_KM
+        linear_dist = (V_KM_S*INTEG_TIMES_HF_PER_ANGLE)*(180/(np.pi*r_s))
+        sat_lats = np.arange(SAT_LATS_HF[0], SAT_LATS_HF[-1], linear_dist)
+    else:
+        sat_lats = SAT_LATS_HF
 
     # ----- Build base geometry once (independent of T) -----
     rays_hf_base = []
@@ -665,8 +715,9 @@ def build_passive_plot_inputs(
     delta_t_vhf_matched = np.full_like(delta_t_hf, delta_t_vhf[vhf_idx])
 
     delta_dt = -(delta_t_vhf_matched - delta_t_hf)                  # seconds
-    tec_residual_after_passive = (C * delta_dt / K_IONO) * freq_factor_h   # m^-2
-    range_error_after_passive = (K_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
+    # Use canonical physics constants
+    tec_residual_after_passive = (C_LIGHT * delta_dt / C_IONO) * freq_factor_h   # m^-2
+    range_error_after_passive = (C_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
 
     return t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive
 
@@ -1353,14 +1404,14 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
     delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
 
     # Convert δ(Δt) to TEC with the HF frequency pair
-    c = 3e8
+    c = C_LIGHT
     f1_h = f_c_hf - 0.5*bw_hf
     f2_h = f_c_hf + 0.5*bw_hf
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     delta_dt_all = -(delta_t_vhf_matched - delta_t_hf)
-    tec_est_ddt_all = (c * delta_dt_all / K_IONO) * freq_factor_h
-    # tec_est_ddt_all = (c * delta_dt_all / 80.6) * freq_factor_h
+    tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h
+    # (legacy) tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h  # use `physics_constants` in code
 
     Ne_rec_ddt = reconstruct_art_sparse(D_hf, tec_est_ddt_all, len(lats), len(alts_m), n_iters, relax)
     return Ne_rec_ddt
@@ -1372,6 +1423,43 @@ def centers_to_edges(c):
     e[0]     = c[0] - 0.5*(c[1] - c[0])
     e[-1]    = c[-1] + 0.5*(c[-1] - c[-2])
     return e
+
+# Print detailed electron-density statistics to validate reconstruction
+def _print_ne_stats(label: str, arr):
+    try:
+        a = np.asarray(arr)
+        if a.size == 0:
+            print(f"{label}: empty array")
+            return
+        # Flatten safety: expect 2D arrays (n_alt x n_lat)
+        mn = float(np.min(a))
+        mx = float(np.max(a))
+        mean = float(np.mean(a))
+        med = float(np.median(a))
+        p25 = float(np.percentile(a, 25))
+        p75 = float(np.percentile(a, 75))
+
+        # Location of min/max (if 2D, map to alt/lat)
+        loc_min = None
+        loc_max = None
+        if a.ndim == 2 and 'lats' in locals() and 'alts_m' in locals():
+            i_min, j_min = np.unravel_index(int(np.argmin(a)), a.shape)
+            i_max, j_max = np.unravel_index(int(np.argmax(a)), a.shape)
+            lat_min = float(lats[j_min])
+            alt_min_m = float(alts_m[i_min])
+            lat_max = float(lats[j_max])
+            alt_max_m = float(alts_m[i_max])
+            loc_min = (i_min, j_min, alt_min_m, lat_min)
+            loc_max = (i_max, j_max, alt_max_m, lat_max)
+
+        print(f"{label}: min={mn:.3e}, p25={p25:.3e}, med={med:.3e}, mean={mean:.3e}, p75={p75:.3e}, max={mx:.3e}")
+        if loc_min is not None and loc_max is not None:
+            print(
+                f"{label} location min idx=(alt_idx={loc_min[0]}, lat_idx={loc_min[1]}) alt={loc_min[2]:.1f} m lat={loc_min[3]:.3f}°, "
+                f"max idx=(alt_idx={loc_max[0]}, lat_idx={loc_max[1]}) alt={loc_max[2]:.1f} m lat={loc_max[3]:.3f}°"
+            )
+    except Exception as e:
+        print(f"{label}: <unavailable> (error: {e})")
 
 # ---------------------- Function calls ----------------------------
 def run_pipeline():
@@ -1566,6 +1654,18 @@ def run_pipeline():
         D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_VHF, bw_hf=BW_HF,
         n_lat=len(lats), n_alt=len(alts_m), n_iters=50, relax=0.2
     )
+
+    # Original ionosphere
+    _print_ne_stats("Original Ne (iono)", iono if 'iono' in locals() else np.array([]))
+    # Reconstructed (unweighted ART)
+    _print_ne_stats("Reconstructed Ne (ART all)", Ne_rec_all if 'Ne_rec_all' in locals() else np.array([]))
+    # Reconstructed (weighted ART)
+    _print_ne_stats("Reconstructed Ne (weighted)", Ne_rec_weighted if 'Ne_rec_weighted' in locals() else np.array([]))
+    # Optional: per-branch reconstructions if available
+    if 'Ne_rec_vhf' in locals():
+        _print_ne_stats("Reconstructed Ne (VHF ART)", Ne_rec_vhf)
+    if 'Ne_rec_hf' in locals():
+        _print_ne_stats("Reconstructed Ne (HF ART)", Ne_rec_hf)
 
     Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
         D_all, vtec_all, weights,

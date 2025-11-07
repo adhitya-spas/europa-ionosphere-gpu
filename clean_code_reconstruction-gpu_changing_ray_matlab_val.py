@@ -17,11 +17,15 @@ NOTE: This uses YOUR existing functions/types/conventions. No behavior changes.
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")  # headless backend
 from matplotlib import colors
 import scipy
 import scipy.sparse as sp 
 import os
 from datetime import datetime
+
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
 
 from modify_df import load_mission_df
 from ionosphere_design import (
@@ -48,35 +52,38 @@ BW_HF   = 1e6         # HF bandwidth [Hz]
 
 # Rays / geometry
 NPTS_VHF = 500        # samples along each VHF ray
-NPTS_HF  = 500        # samples along each HF ray (match VHF to keep ds small)
+NPTS_HF  = 800        # samples along each HF ray (increase resolution to reduce discretization)
 SAT_LATS_VHF = np.linspace(-10.0, 10.0, 60)  #np.linspace(-10.0, -5.0, 10)  # ground-track latitudes for rays
-SAT_LATS_HF = np.linspace(-8, 8, 16)
+SAT_LATS_HF    = np.linspace(-6.0, 6.0, 181)       # 0.067° spacing
 RAY_TRACE_MODE = "left_fixed"  # "left_fixed" or "sat_right" or "mirror"
 
 # HF true incidence angles (from vertical, 0° = nadir)
-# THETA_LIST_HF = [30, 40, 50, 60, 70, 80, 85]
-THETA_LIST_HF = np.linspace(5, 16, 20) # [-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,1,2,3,4,5,6,7,8,9,10]
+# Use 1° resolution for θ–e validation
+THETA_LIST_HF = np.arange(5, 85, 1)
 
 # Integration times (seconds), per your current logic
 INTEG_TIMES_VHF = 0.12
 # INTEG_TIMES_HF_PER_ANGLE = np.array([0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14])
-INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)  # 20 values from 0.05s to 0.15s
+# INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 100)  # 20 values from 0.05s to 0.15s
+# For the θ–e validation, use a single per-angle integration time so geometry is independent of T
+INTEG_TIMES_HF_PER_ANGLE = np.array([0.12])
 
 # ART settings
 N_ITERS = 20
 RELAX   = 0.1
 
-# Some constants
-C = 3e8  # speed of light [m/s]
-K_IONO = 40.3  # ionospheric delay constant in SI: Δt = K_IONO * TEC / (c f^2)
+# Use physics_constants for canonical physical values
 
 # Create one timestamped folder per process start
 IMG_TS = datetime.now().strftime("%m_%d_%H_%M_%S")
 IMG_DIR = os.path.join("img", IMG_TS)
 os.makedirs(IMG_DIR, exist_ok=True)
 
-# Top-level smoothing toggle (0.0 = off)
-SMOOTH_SIGMA = 1.2
+# Top-level smoothing toggle (0.0 = off). Use reduced smoothing for visualization only.
+SMOOTH_SIGMA = 0.8
+
+# Reproducibility for validation
+np.random.seed(0)
 
 TEST_CHECKS = False  # run unit test checks before main
 # ---------------------- Step -1: GPU SUBSTITUTES ----------------------
@@ -131,7 +138,7 @@ def build_passive_plot_inputs_GPU(
     delta_tec_abs_gpu = cp.abs(stec_est_gpu - tec_true_gpu)
 
     # ---- 3B) δ(Δt) residual → TEC → VHF range error ----
-    c = cp.asarray(3e8, dtype=cp.float32)
+    c = cp.asarray(C_LIGHT, dtype=cp.float32)
     f1_h = cp.asarray(F_C_HF - 0.5*BW_HF, dtype=cp.float32)
     f2_h = cp.asarray(F_C_HF + 0.5*BW_HF, dtype=cp.float32)
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
@@ -143,8 +150,8 @@ def build_passive_plot_inputs_GPU(
     dt_vhf_match_gpu = cp.full_like(dt_hf_gpu, dt_vhf_gpu[vhf_idx])
     delta_dt_gpu = -(dt_vhf_match_gpu - dt_hf_gpu)
 
-    tec_residual_gpu = (c * delta_dt_gpu / K_IONO) * freq_factor_h    # m^-2
-    range_err_gpu    = (K_IONO / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
+    tec_residual_gpu = (c * delta_dt_gpu / cp.asarray(C_IONO, dtype=cp.float32)) * freq_factor_h    # m^-2
+    range_err_gpu    = (cp.asarray(C_IONO, dtype=cp.float32) / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
 
     # ---- Return NumPy for plotting, keep GPU speed for compute ----
     t_meas      = cp.asnumpy(integ_gpu)
@@ -384,7 +391,7 @@ def step3_forward_model(iono, lats, alts_m,
     return vtec_vhf, delta_t_vhf, vtec_hf, delta_t_hf
 
 # ===== GPU STEP 3: Forward model (TEC truth via D_hf @ x on GPU) =====
-USE_GPU = True
+# USE_GPU = True
 try:
     import cupy as cp
     import cupyx.scipy.sparse as cpx_sparse
@@ -469,10 +476,14 @@ def step5_reconstruct(D_vhf, D_hf, vtec_vhf, vtec_hf,
     else:
         Ne_rec_hf = reconstruct_art(D_hf, vtec_hf, n_lat, n_alt, n_iters, relax)
 
-    # Combined
-    D_all = sp.vstack([D_vhf, D_hf], format="csr") if (sp.issparse(D_vhf) or sp.issparse(D_hf)) \
-            else np.vstack([D_vhf, D_hf])
-    vtec_all = np.concatenate([vtec_vhf, vtec_hf])
+    # Geometry stacking must be VHF first, then HF.
+    D_all = sp.vstack([D_vhf, D_hf]).tocsr()
+    # Measurement stacking must match D_all row order.
+    vtec_all = np.r_[vtec_vhf, vtec_hf]
+
+    # Sanity checks
+    assert D_all.shape[0] == vtec_all.shape[0], "Row count of D_all must match len(vtec_all)"
+    assert D_vhf.shape[0] + D_hf.shape[0] == D_all.shape[0], "Combined row count mismatch"
 
     if sp.issparse(D_all):
         Ne_rec_all = reconstruct_art_sparse(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
@@ -495,15 +506,17 @@ def step5_weighted_reconstruct(D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_V
                                n_lat=None, n_alt=None,
                                n_iters=50, relax=0.2):
     # Build bandwidth & integration arrays aligned with stacked measurements
-    all_integration_times = np.concatenate([integ_vhf, integ_hf])
-    all_bandwidths = np.concatenate([
-        np.full(integ_vhf.shape[0], bw_vhf),
-        np.full(integ_hf.shape[0],  bw_hf)
-    ])
-    weights = calculate_measurement_weights(
-        integration_times=all_integration_times,
-        bandwidths=all_bandwidths
-    )
+    t_all = np.r_[integ_vhf, integ_hf]
+    bw_all = np.r_[
+        np.full_like(integ_vhf, BW_VHF, dtype=float),
+        np.full_like(integ_hf,  BW_HF,  dtype=float),
+    ]
+
+    # Sanity checks
+    assert t_all.shape[0] == bw_all.shape[0] == vtec_all.shape[0] == D_all.shape[0], \
+        f"Length mismatch: t={t_all.shape}, bw={bw_all.shape}, y={vtec_all.shape}, D={D_all.shape}"
+
+    weights = calculate_measurement_weights(t_all, bw_all)  # shape = (n_meas,)
     if sp.issparse(D_all):
         Ne_rec_weighted = weighted_reconstruction_art_sparse(
             D_all, vtec_all, weights, n_lat, n_alt, n_iters=n_iters, relax=relax
@@ -538,7 +551,10 @@ def plot_recons(lats, alts_m, recs, titles):
         if ax is axs[0]:
             ax.set_ylabel("Altitude (km)")
         fig.colorbar(im, ax=ax, label='Ne (×10⁶ cm⁻³)')
-    plt.tight_layout(); plt.show(block=False); plt.savefig(os.path.join(IMG_DIR, "A_gpu_reconstructions.png"))
+    plt.tight_layout(); 
+    # plt.show(block=False); 
+    plt.savefig(os.path.join(IMG_DIR, "A_gpu_reconstructions.png"))
+    plt.close('all')
 
 def plot_raypaths(lats, alts_m, rays_hf, theta_per_ray, rays_vhf,
                   title_hf="Modeled Raypaths (HF)",
@@ -625,8 +641,9 @@ def plot_raypaths(lats, alts_m, rays_hf, theta_per_ray, rays_vhf,
     ax_vhf.grid(False)
 
     plt.tight_layout()
-    plt.show(block=False)
+    # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "B_gpu_raypaths.png"))
+    plt.close('all')
 
 def build_passive_plot_inputs(
     iono, lats, alts_m,
@@ -665,8 +682,9 @@ def build_passive_plot_inputs(
     delta_t_vhf_matched = np.full_like(delta_t_hf, delta_t_vhf[vhf_idx])
 
     delta_dt = -(delta_t_vhf_matched - delta_t_hf)                  # seconds
-    tec_residual_after_passive = (C * delta_dt / K_IONO) * freq_factor_h   # m^-2
-    range_error_after_passive = (K_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
+    # Use canonical physics constants for clarity
+    tec_residual_after_passive = (C_LIGHT * delta_dt / C_IONO) * freq_factor_h   # m^-2
+    range_error_after_passive = (C_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
 
     return t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive
 
@@ -679,6 +697,10 @@ def plot_passive_tec_error_heatmap_from_arrays(
     cmap="plasma",
     smooth_sigma: float = 0.0,
 ):
+
+    t_min, t_max = np.percentile(t_meas, [1, 99])
+    tec_min, tec_max = np.percentile(tec_for_bin, [1, 99])
+    
     df = pd.DataFrame({
         "vtec": tec_for_bin,           # y-axis (slant TEC truth)
         "t": t_meas,                   # x-axis (integration time, s)
@@ -725,8 +747,9 @@ def plot_passive_tec_error_heatmap_from_arrays(
     plt.title(title)
     plt.colorbar(label="ΔTEC Error (m$^{-2}$)")
     plt.tight_layout()
-    plt.show(block=False)
+    # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "C_passive_tec_error_heatmap_from_arrays.png"))
+    plt.close('all')
 
 
 def plot_vhf_range_error_heatmap_from_arrays(
@@ -778,8 +801,9 @@ def plot_vhf_range_error_heatmap_from_arrays(
     plt.title(title)
     plt.colorbar(label="Δr (meters)")
     plt.tight_layout()
-    plt.show(block=False)
+    # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "D_vhf_range_error_heatmap.png"))
+    plt.close('all')
 
 
 def plot_passive_tec_error_heatmap_GPU(
@@ -791,6 +815,12 @@ def plot_passive_tec_error_heatmap_GPU(
     # Filter on CPU (cheap) to keep plotting logic identical
     df = pd.DataFrame({"t": t_meas, "vtec": tec_for_bin, "err": delta_tec_err_passive})
     df = df[(df["t"]>=t_min)&(df["t"]<=t_max)&(df["vtec"]>=tec_min)&(df["vtec"]<=tec_max)]
+
+    # guard against empty after masking
+    if df.shape[0] == 0:
+        warnings.warn("No samples after masking; skipping GPU heatmap.")
+        return None
+
 
     t_edges   = np.linspace(t_min,   t_max,   nbins_t)
     tec_edges = np.linspace(tec_min, tec_max, nbins_tec)
@@ -821,8 +851,9 @@ def plot_passive_tec_error_heatmap_GPU(
     plt.title(title)
     plt.colorbar(label="ΔTEC Error (m$^{-2}$)")
     plt.tight_layout()
-    plt.show(block=False)
+    # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "C_gpu_hf_passive_tec_error_heatmap.png"))
+    plt.close('all')
 
 
 def plot_vhf_range_error_heatmap_GPU(
@@ -862,8 +893,9 @@ def plot_vhf_range_error_heatmap_GPU(
     plt.title(title)
     plt.colorbar(label="Δr (meters)")
     plt.tight_layout()
-    plt.show(block=False)
+    # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, "D_gpu_vhf_range_error_heatmap.png"))
+    plt.close('all')
 
 
 def _colcounts_to_grid(col_counts, n_alt, n_lat):
@@ -893,52 +925,13 @@ def plot_ray_coverage_heatmap(D, lats, alts_m, title="Ray coverage (hits per vox
     col_counts = D.getnnz(axis=0) if sp.issparse(D) else np.count_nonzero(D, axis=0)
     grid = _colcounts_to_grid(col_counts, n_alt, n_lat)
     fig, ax = _imshow_lat_alt(grid, lats, alts_m, title, cmap="magma", cbar_label="# ray hits")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlim(1e-17, 1e-13)
+    # ax.set_xscale("log")
+    # ax.set_yscale("log")
+    # ax.set_xlim(1e-17, 1e-13)
     plt.savefig(os.path.join(IMG_DIR, "E_ray_coverage_heatmap.png"))
     return fig, ax
 
 # 2) Δt vs 1/f² check
-def plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, f_hf, f_vhf, title="|Δt| vs 1/f²"):
-    # x = 1/f^2 for each band (constant per band)
-    invf2_hf  = np.full_like(delta_t_hf,  1.0 / (f_hf**2),  dtype=float)
-    invf2_vhf = np.full_like(delta_t_vhf, 1.0 / (f_vhf**2), dtype=float)
-
-    y_hf  = np.abs(delta_t_hf)
-    y_vhf = np.abs(delta_t_vhf)
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.6))
-    ax.scatter(invf2_hf,  y_hf,  s=6,  alpha=0.4, label="HF")
-    ax.scatter(invf2_vhf, y_vhf, s=20, alpha=0.7, label="VHF", marker="x")
-
-    # log–log so both clusters are visible and trend is linear with slope ≈ 1
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-
-    # Nice bounds
-    x_all = np.concatenate([invf2_hf, invf2_vhf])
-    y_all = np.concatenate([y_hf, y_vhf])
-    ax.set_xlim(x_all.min()*0.8, x_all.max()*1.2)
-    ax.set_ylim(max(y_all.min()*0.8, 1e-12*np.max(y_all)), y_all.max()*1.2)
-
-    ax.set_xlabel("1 / f² (Hz⁻²)")
-    ax.set_ylabel("|Δt| (s)")
-    ax.set_title(title)
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
-
-    # Optional: draw a reference line with slope 1 through the HF median point
-    x0 = np.median(invf2_hf)
-    y0 = np.median(y_hf)
-    x_ref = np.array([x_all.min(), x_all.max()])
-    y_ref = y0 * (x_ref / x0)  # slope 1 in log–log means y ~ x
-    ax.plot(x_ref, y_ref, ls="--", lw=1.2, color="gray", label="_nolegend_")
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(IMG_DIR, "E_dt_vs_invf2.png"), dpi=200, bbox_inches="tight")
-    return fig, ax
-
 def plot_dt_vs_invf2(delta_t_hf, delta_t_vhf, f_hf, f_vhf, title="|Δt| vs 1/f²"):
     # x = 1/f^2 for each band (constant per band)
     invf2_hf  = np.full_like(delta_t_hf,  1.0 / (f_hf**2),  dtype=float)
@@ -1016,26 +1009,32 @@ def plot_residuals_vs_angle_time(D_all, vtec_all, D_vhf, theta_per_ray_hf, integ
     """
     n_vhf = D_vhf.shape[0]
     yhat = D_all @ Ne_rec.ravel(order="C")
-    r = (yhat - vtec_all).astype(float)
-    r_hf = r[n_vhf:]
+    r_all = (yhat - vtec_all).astype(float)
+
+    # HF-only residuals start after the VHF block
+    r_hf = r_all[n_vhf:]
+
     th = np.asarray(theta_per_ray_hf, float)
     T  = np.asarray(integ_hf, float)
+    assert r_hf.shape[0] == th.shape[0] == T.shape[0], "HF residuals must align with HF angles and integration times"
 
+    # scatter |residual| vs θ
     fig1, ax1 = plt.subplots(figsize=(6.6, 4.6))
     ax1.scatter(th, np.abs(r_hf), s=6, alpha=0.5)
     ax1.set_xlabel("θ (deg from vertical)")
     ax1.set_ylabel("|Residual|")
     ax1.set_title(f"{title_prefix}: |resid| vs θ"); ax1.grid(True, alpha=0.3)
+    fig1.tight_layout()
 
-    # Bin by unique T values (or quantile bins if continuous)
+    # boxplot |residual| vs unique T
     unique_T = np.unique(T)
     fig2, ax2 = plt.subplots(figsize=(6.6, 4.6))
-    data = [np.abs(r_hf[T==t]) for t in unique_T]
-    ax2.boxplot(data, labels=[f"{t:.2f}s" for t in unique_T], showfliers=False)
+    data = [np.abs(r_hf[T == t]) for t in unique_T]
+    ax2.boxplot(data, tick_labels=[f"{t:.3f}s" for t in unique_T], showfliers=False)
     ax2.set_xlabel("Integration time T (s)")
     ax2.set_ylabel("|Residual|")
     ax2.set_title(f"{title_prefix}: |resid| vs T"); ax2.grid(True, alpha=0.3)
-    fig1.tight_layout(); fig2.tight_layout()
+    fig2.tight_layout()
 
     fig1.savefig(os.path.join(IMG_DIR, "H_residuals_vs_angle.png"))
     fig2.savefig(os.path.join(IMG_DIR, "I_residuals_vs_integration_time.png"))
@@ -1165,10 +1164,12 @@ def plot_voxel_uncertainty_proxy(D_all, lats, alts_m, title="Per-voxel uncertain
     else:
         diag_proxy = np.sum(D_all*D_all, axis=0)
     grid = _colcounts_to_grid(diag_proxy, n_alt, n_lat)
-    fig = _imshow_lat_alt(grid, lats, alts_m, title, cmap="plasma", cbar_label="∑ weights² (arb)")
+    fig, ax = _imshow_lat_alt(grid, lats, alts_m, title, cmap="plasma", cbar_label="∑ weights² (arb)")
+    # optional: log color scale
     vmax = np.percentile(diag_proxy, 99)
-    plt.imshow(grid, norm=colors.LogNorm(vmin=1e8, vmax=vmax), cmap="plasma")
-    plt.savefig(os.path.join(IMG_DIR, "M_voxel_uncertainty_proxy.png"))
+    from matplotlib.colors import LogNorm
+    ax.images[0].set_norm(LogNorm(vmin=max(1.0, np.percentile(diag_proxy, 1)), vmax=vmax))
+    fig.savefig(os.path.join(IMG_DIR, "M_voxel_uncertainty_proxy.png"), dpi=200, bbox_inches="tight")
     return fig
 
 def _rmse_from(D, x_c, y):
@@ -1335,21 +1336,35 @@ def weighted_art_with_history(D, y, w, *, n_lat, n_alt, n_iters=20, relax=0.1, x
 # ---------------------- Step7: Peters MATLAB validation -----------------
 # ---------- Peters Fig. 7 (ellipse toy model) ----------
 
-def peters_dtec_from_range(dr=3.0, fv=60e6, fh=9e6, alpha=1.69e-6, c=3e8):
+def make_eccentric_iono(base_Ne_alt_lat, e):
+    """
+    base_Ne_alt_lat: (n_alt, n_lat) truth at e=0
+    e: scalar in [0, ~0.65]
+    Returns: (n_alt, n_lat) Ne with day-night skew ~ e.
+    """
+    n_alt, n_lat = base_Ne_alt_lat.shape
+    lat_axis = np.linspace(-1, 1, n_lat)
+    day_gain = 1.0 + e * np.clip(lat_axis, 0, 1)  
+    Ne = base_Ne_alt_lat * day_gain[None, :]
+    return Ne
+    
+def peters_dtec_from_range(dr=3.0, fv=60e6, fh=9e6, alpha=1.69e-6, c=C_LIGHT):
     """
     MATLAB lines:
         dTEC = (2*dr*2*pi*fv^2)/(c*alpha)
     """
     return (2*dr*2*np.pi*fv*fv)/(c*alpha)
 
-def peters_dt_from_TEC(TEC, fv=60e6, fh=9e6, c=3e8):
+def peters_dt_from_TEC(TEC, fv=60e6, fh=9e6, c=C_LIGHT):
     """
     MATLAB lines:
-        dt_true = (TEC*80.6)*((fv^2)-(fh^2))/(c*(fv^2)*(fh^2))
-    80.6 = c * K_ionosphere in SI units (≈ 40.3*c/ (2π) depending on convention).
-    We mirror MATLAB so you can 1:1 reproduce its numbers.
+        # Use unified forward formula: delta_t = (C_IONO / C_LIGHT) * TEC * (1/f_low^2 - 1/f_high^2)
+        # Here fh is the lower HF frequency and fv the higher VHF frequency in the demo
+        dt_true = (C_IONO / c) * TEC * (1.0/(fh**2) - 1.0/(fv**2))
+    Historically a numeric 80.6 factor was used; this codebase uses
+    `physics_constants.C_IONO` and `physics_constants.C_LIGHT` for clarity.
     """
-    return (TEC*80.6)*((fv**2)-(fh**2))/(c*(fv**2)*(fh**2))
+    return dt_true
 
 def peters_theta_tecerror_surface(e_vec=None, ra=4e15, n_x=1000):
     """
@@ -1417,14 +1432,15 @@ def plot_peters_fig7_like(angles_deg, e_vec, TEC_err, out_png):
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("TEC Error (m$^{-2}$)")
     ax.set_xlim(0, 90)
-    ax.set_ylim(e_vec.min(), min(e_vec.max(), 0.625))  # match MATLAB's display
+    # Force the upper y-limit to 0.625 to match the MATLAB figure framing
+    ax.set_ylim(e_vec.min(), 0.625)
     fig.tight_layout()
     fig.savefig(out_png, dpi=200, bbox_inches="tight")
     return fig, ax
 
 # ---------- Reconstruction-based θ–e surface ----------
 
-def make_eccentric_iono(alt_km_1d, Ne_1d, e, lat_extent=(-10,10), lat_res=200):
+def make_eccentric_iono_param(alt_km_1d, Ne_1d, e, lat_extent=(-10,10), lat_res=200):
     """
     Build an ionosphere with a mild day/night asymmetry controlled by 'e' (0..~0.6).
     We keep total TEC roughly stable by normalizing back to the base median.
@@ -1436,13 +1452,87 @@ def make_eccentric_iono(alt_km_1d, Ne_1d, e, lat_extent=(-10,10), lat_res=200):
     scale_lat = 1.0 + e * np.tanh(lats / L)
     iono_e = iono * scale_lat[np.newaxis, :]
 
-    # normalize so median TEC stays similar to base (optional but helps apples-to-apples)
+    # normalize so median TEC stays similar to base 
     base_med = np.median(iono)
     new_med  = np.median(iono_e)
     if new_med > 0:
         iono_e *= (base_med / new_med)
 
     return lats, alt_km, alts_m, iono_e
+
+
+def theta_e_surface_tecerr(alt_km_1d, Ne_1d, D_hf, rays_hf, theta_per_ray, integ_hf,
+                          lats_base=None, alts_m_base=None,
+                          e_values=np.linspace(0.01, 0.625, 25), theta_bins=None,
+                          vmax=2.68e14, out_png=None):
+    """
+    Reconstruction-free TEC error θ–e surface.
+    For each eccentricity e:
+      - build eccentric ionosphere -> x_true (n_alt*n_lat)
+      - compute tec_true = D_hf @ x_true
+      - compute vtec_hf (noisefree) via step3_forward_model_gpu -> vtec_hf
+      - compute tec_est = vtec_hf / cos(theta)
+      - compute dtec_abs = |tec_est - tec_true|
+      - bin dtec_abs by theta bins (unique theta_per_ray) and average
+    Returns (theta_vals, e_values, heat)
+    """
+    # theta bins
+    theta_vals, angle_bins = compute_angle_bins(theta_per_ray) if theta_bins is None else (np.asarray(theta_bins), None)
+    if angle_bins is None:
+        # recompute angle_bins for provided theta_vals
+        _, angle_bins = compute_angle_bins(theta_per_ray)
+
+    heat = np.zeros((len(e_values), len(theta_vals)), dtype=float)
+
+    # Require lats_base to build eccentric ionosphere grid
+    if lats_base is None or alts_m_base is None:
+        raise ValueError("theta_e_surface_tecerr requires lats_base and alts_m_base to be provided")
+
+    for i, e in enumerate(e_values):
+        # build eccentric ionosphere
+        lats_e, alt_km_e, alts_m_e, iono_e = make_eccentric_iono_param(alt_km_1d, Ne_1d, e,
+                                                                  lat_extent=(float(lats_base.min()), float(lats_base.max())),
+                                                                  lat_res=len(lats_base))
+
+        # flattened true electron density
+        x_true = iono_e.ravel(order="C").astype(np.float32)
+
+        # compute slant TEC truth
+        tec_true = (D_hf @ x_true).astype(float)
+
+        # noisefree forward model to obtain vtec_hf (then passive estimate)
+        integ_noisefree = np.full_like(integ_hf, 1e9, dtype=float)
+        _, vtec_hf_e, _ = step3_forward_model_gpu(iono=iono_e, lats=lats_e, alts_m=alts_m_e,
+                                                 D_hf=D_hf, theta_per_ray=theta_per_ray,
+                                                 integ_hf=integ_noisefree, f_c_hf=F_C_HF, bw_hf=BW_HF)
+
+        # passive HF estimate -> slant TEC
+        theta_rad = np.deg2rad(np.asarray(theta_per_ray, float))
+        tec_est = (vtec_hf_e / np.cos(theta_rad)).astype(float)
+
+        dtec_abs = np.abs(tec_est - tec_true)
+
+        # bin by theta
+        for j, idx in enumerate(angle_bins):
+            if idx.size:
+                heat[i, j] = np.mean(dtec_abs[idx])
+
+    # plot
+    fig, ax = plt.subplots(figsize=(7.8, 5.6))
+    im = ax.pcolormesh(theta_vals, e_values, heat, shading="auto", cmap="jet", vmin=0.0, vmax=vmax)
+    ax.set_xlabel("Angle of Incidence (Degrees)")
+    ax.set_ylabel("Ionosphere Eccentricity")
+    ax.set_title("Maximum Incidence Angle for TEC Error (Reconstruction-free)")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("TEC Error (m$^{-2}$)")
+    ax.set_xlim(0, 90)
+    ax.set_ylim(e_values.min(), 0.625)
+    fig.tight_layout()
+    if out_png:
+        fig.savefig(out_png, dpi=200, bbox_inches="tight")
+
+    print("[θ–e] Made noise-free passive TEC-error surface.")
+    return theta_vals, e_values, heat
 
 
 def compute_angle_bins(theta_per_ray):
@@ -1454,77 +1544,86 @@ def compute_angle_bins(theta_per_ray):
 
 
 def recon_theta_e_surface(
-    alt_km_1d, Ne_1d,
-    rays_hf, theta_per_ray, integ_hf,
-    lats_base, alts_m_base,
-    e_vec=np.linspace(0.0, 0.6, 25),
-    n_iters=10, relax=0.15,
-    use_weighted=True,
-    out_png=None
+    theta_vals_deg,
+    e_vals,
+    base_truth_Ne,                 # (n_alt, n_lat) truth for e=0
+    hf_raypack_builder,            # callable: rays_hf = hf_raypack_builder(theta_deg)
+    D_vhf,                         # fixed VHF straight-line geometry (csr)
+    lats, alts_m,
+    solver_fn,                     # callable: Ne_rec = solver_fn(D_all, y_all, lats, alts_m)
+    mode="vhf_plus_hf_toy",        # or "vhf_only"
+    toy_dtec_fn=None,              # callable: dTEC = toy_dtec_fn(theta_deg, e)
+    n_iter_hint=4                  # keep small so the sweep is fast
 ):
     """
-    Build a θ–e heatmap where each cell is the mean absolute HF residual after reconstruction.
-    Residual = |(D·Ne_rec - V)|. Rows = eccentricity e, Cols = incidence angle θ.
+    Builds a (θ,e) surface by *re-simulating data per pixel* and re-solving quickly.
+    Returns: theta_vals_deg, e_vals, heat  where heat[ie,it] is a scalar residual metric.
     """
-    # angles/bins from your HF geometry
-    theta_vals, angle_bins = compute_angle_bins(theta_per_ray)
+    theta_vals = np.asarray(theta_vals_deg, float)
+    e_vals     = np.asarray(e_vals, float)
 
-    # build D once from rays_hf & the lat/alt grid shape
-    D_vhf_dummy = sp.csr_matrix((0, len(lats_base)*len(alts_m_base)))  # not used, just to match existing builder
-    D_hf = build_geometry_matrix_weighted_sparse(rays_hf, lats_base, alts_m_base, dtype=np.float32)
-
-    heat = np.zeros((len(e_vec), len(theta_vals)), dtype=float)
-
-    for i, e in enumerate(e_vec):
-        # (1) ionosphere with eccentricity e
-        lats, alt_km, alts_m, iono_e = make_eccentric_iono(alt_km_1d, Ne_1d, e,
-                                                           lat_extent=(lats_base.min(), lats_base.max()),
-                                                           lat_res=len(lats_base))
-
-        # (2) forward model (GPU path if enabled)
-        tec_true, vtec_hf, delta_t_hf = step3_forward_model_gpu(
-            iono=iono_e, lats=lats, alts_m=alts_m,
-            D_hf=D_hf,
-            theta_per_ray=theta_per_ray,
-            integ_hf=integ_hf,
-            f_c_hf=F_C_HF, bw_hf=BW_HF
-        )
-
-        # (3) reconstruct (use your weighted ART that you already trust)
-        # build measurement vector 'y' for HF-only recon
-        y = vtec_hf.astype(np.float64)
-        if use_weighted:
-            # simple per-ray weights from your bandwidth/integration rule
-            w = calculate_measurement_weights(integ_hf, BW_HF)
+    # sanity on base truth orientation
+    if base_truth_Ne.shape != (len(alts_m), len(lats)):
+        if base_truth_Ne.shape == (len(lats), len(alts_m)):
+            base_truth_Ne = base_truth_Ne.T
         else:
-            w = np.ones_like(y)
+            raise ValueError(f"base_truth_Ne shape {base_truth_Ne.shape} "
+                             f"!= {(len(alts_m), len(lats))} or its transpose")
 
-        # reuse your helper with history disabled: few iterations for speed
-        Ne_rec = weighted_reconstruction_art_sparse(
-            D_hf, y, n_lat=len(lats), n_alt=len(alts_m),
-            n_iters=n_iters, relax=relax, weights=w
-        )
+    heat = np.zeros((len(e_vals), len(theta_vals)), dtype=float)
 
-        # (4) residuals per angle
-        yhat = (D_hf @ Ne_rec.ravel(order="C")).astype(np.float64)
-        r = np.abs(yhat - y)
+    for ie, e in enumerate(e_vals):
+        # --- 1) e-dependent ionosphere
+        Ne_true_e = make_eccentric_iono(base_truth_Ne, e)        # (n_alt, n_lat)
+        y_vhf_e   = D_vhf @ Ne_true_e.ravel(order="C")           # VHF slant TEC
 
-        for j, idx in enumerate(angle_bins):
-            if idx.size:
-                heat[i, j] = np.mean(r[idx])
+        for it, theta in enumerate(theta_vals):
+            # --- 2) θ-dependent HF geometry (so θ actually matters)
+            rays_hf = hf_raypack_builder(theta)
+            D_hf    = build_geometry_matrix_weighted_sparse(rays_hf, lats, alts_m)  # csr
 
-    # (5) plot
-    fig, ax = plt.subplots(figsize=(7.8, 5.6))
-    im = ax.pcolormesh(theta_vals, e_vec, heat, shading="auto", cmap="magma")
-    ax.set_xlabel("Incidence angle θ (deg from vertical)")
-    ax.set_ylabel("Eccentricity proxy e (day–night skew)")
-    ax.set_title("Reconstruction-derived mean |HF residual| (θ × e)")
-    cb = fig.colorbar(im, ax=ax)
-    cb.set_label("|Residual| (m$^{-2}$)")
-    fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=200, bbox_inches="tight")
-    return theta_vals, e_vec, heat
+            if mode == "vhf_only":
+                # VHF-only surface (weak e unless Ne changes strongly)
+                y_all = y_vhf_e
+                D_all = D_vhf
+
+            elif mode == "vhf_plus_hf_toy":
+                # Use HF = forward(Ne_true_e) + Peters-like ΔTEC(θ,e)
+                y_hf_true = D_hf @ Ne_true_e.ravel(order="C")     # HF "TEC" from Ne (toy)
+                if toy_dtec_fn is None:
+                    raise ValueError("Provide toy_dtec_fn(theta_deg, e) for vhf_plus_hf_toy mode.")
+                dTEC_err   = toy_dtec_fn(theta, e)                # scalar or per-ray; allow scalar
+                if np.ndim(dTEC_err) == 0:
+                    dTEC_err = np.full(y_hf_true.shape, float(dTEC_err))
+                # Inject the error so that θ and e imprint the data (Fig. 7 effect)
+                y_hf_e = y_hf_true + dTEC_err
+
+                # stack channels
+                D_all = sp.vstack([D_vhf, D_hf], format="csr")
+                y_all = np.concatenate([y_vhf_e, y_hf_e])
+
+            else:
+                raise ValueError(f"Unknown mode {mode}")
+
+            # --- 3) quick reconstruction for this pixel (few iters)
+            Ne_rec_e = solver_fn(D_all, y_all, lats, alts_m, max_iters=n_iter_hint)
+
+            # --- 4) residual metric -> heat map
+            resid = (D_all @ Ne_rec_e.ravel(order="C")) - y_all
+            heat[ie, it] = np.sqrt(np.mean(resid**2))  # RMSE; change if you prefer mean |resid|
+
+        if ie == len(e_vals)//2:
+            print(f"[DEBUG] e={e:.3f}, mean|resid| per θ:", 
+                [np.mean(np.abs(resid)) for resid in heat[ie, :]])
+
+
+    return theta_vals, e_vals, heat
+
+
+def _build_geom_for_surface(iono_e, hf_raypack, *, lats, alts_m, rays_vhf, band='hf'):
+    D_hf_e  = build_geometry_matrix_weighted_sparse(hf_raypack, lats, alts_m, dtype=np.float32)
+    D_vhf_e = build_geometry_matrix_weighted_sparse(rays_vhf,  lats, alts_m, dtype=np.float32)
+    return D_hf_e, D_vhf_e
 
 
 
@@ -1545,17 +1644,21 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
     sat_lats_vhf = SAT_LATS_VHF
     origin_lat = SAT_LATS_VHF[0]
     origin_lat_idx = int(np.argmin(np.abs(sat_lats_vhf - origin_lat)))
-    delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
+    # delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
+    # per-HF-ray nearest VHF latitude match
+    hf_start_lats = np.full(len(delta_t_hf), SAT_LATS_VHF[0])  # or pass true HF starts
+    vhf_idx = np.argmin(np.abs(SAT_LATS_VHF[None, :] - hf_start_lats[:, None]), axis=1)
+    delta_t_vhf_matched = delta_t_vhf[vhf_idx]
 
     # Convert δ(Δt) to TEC with the HF frequency pair
-    c = 3e8
+    c = C_LIGHT
     f1_h = f_c_hf - 0.5*bw_hf
     f2_h = f_c_hf + 0.5*bw_hf
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     delta_dt_all = -(delta_t_vhf_matched - delta_t_hf)
-    tec_est_ddt_all = (c * delta_dt_all / K_IONO) * freq_factor_h
-    # tec_est_ddt_all = (c * delta_dt_all / 80.6) * freq_factor_h
+    tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h
+    # (legacy) tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h  # use `physics_constants` in code
 
     Ne_rec_ddt = reconstruct_art_sparse(D_hf, tec_est_ddt_all, len(lats), len(alts_m), n_iters, relax)
     return Ne_rec_ddt
@@ -1587,33 +1690,36 @@ def run_pipeline():
         lats, alts_m,
         theta_list_hf=THETA_LIST_HF,  # or your list
         sat_lats=SAT_LATS_HF,  # np.linspace(-6.0, 6.0, 181),   # denser tracks for richer TEC
-        npts_hf=500,
-        t_sweep= INTEG_TIMES_HF_PER_ANGLE  # np.linspace(0.05, 0.15, 21)     # dense T grid (x-axis)
+        npts_hf=NPTS_HF,
+        t_sweep= INTEG_TIMES_HF_PER_ANGLE  # dense T grid (x-axis)
         )
         rays_vhf = trace_passive_nadir(SAT_LATS_VHF, alts_m, npts=NPTS_VHF)
         integ_vhf = np.full(len(rays_vhf), INTEG_TIMES_VHF, dtype=float)
 
     # Step 3
+        # Step 3
     if not USE_GPU:
         vtec_vhf, delta_t_vhf, vtec_hf, delta_t_hf = step3_forward_model(
             iono, lats, alts_m, rays_vhf, integ_vhf, rays_hf, theta_per_ray, integ_hf
         )
     else:
-        # D_hf = build_geometry_matrix_weighted_sparse(rays_hf, lats, alts_m, dtype=np.float32)
-        # D_vhf = build_geometry_matrix_weighted_sparse(rays_vhf, lats, alts_m, dtype=np.float32)
+        # Build geometry first (needed by GPU forward model)
         D_vhf, D_hf = step4_build_geometry(rays_vhf, rays_hf, lats, alts_m)
         print("HF geometry:", D_hf.shape, "nnz=", D_hf.nnz, "density=", D_hf.nnz/(D_hf.shape[0]*D_hf.shape[1]))
         print("VHF geometry:", D_vhf.shape, "nnz=", D_vhf.nnz, "density=", D_vhf.nnz/(D_vhf.shape[0]*D_vhf.shape[1]))
-        D_all = scipy.sparse.vstack([D_vhf, D_hf], format="csr")
-        # D_all_gpu = cpx_sparse.csr_matrix(D_all)
 
+        # HF path (GPU): truth TEC via D_hf @ x; then VTEC + Δt via helper
         tec_true, vtec_hf, delta_t_hf = step3_forward_model_gpu(
-        iono=iono, lats=lats, alts_m=alts_m,
-        D_hf=D_hf,
-        theta_per_ray=theta_per_ray,
-        integ_hf=integ_hf,
-        f_c_hf=F_C_HF, bw_hf=BW_HF
+            iono=iono, lats=lats, alts_m=alts_m,
+            D_hf=D_hf,
+            theta_per_ray=theta_per_ray,
+            integ_hf=integ_hf,
+            f_c_hf=F_C_HF, bw_hf=BW_HF
         )
+        
+        if USE_GPU:
+            cp.get_default_memory_pool().free_all_blocks()
+
         # VHF path (CPU; cheap)
         stec_vhf = np.array([compute_STEC_along_path(iono, lats, alts_m, ray) for ray in rays_vhf])
         vtec_vhf, delta_t_vhf = dualfreq_to_VTEC(
@@ -1624,6 +1730,42 @@ def run_pipeline():
             integration_time=integ_vhf,
             return_deltat=True
         )
+
+    # Combined geometry & measurement vectors (VHF first, then HF)
+    if not USE_GPU:
+        D_vhf, D_hf = step4_build_geometry(rays_vhf, rays_hf, lats, alts_m)
+    D_all = sp.vstack([D_vhf, D_hf]).tocsr()
+    vtec_all = np.r_[vtec_vhf, vtec_hf]
+
+    # Quick consistency checks
+    n_vhf = D_vhf.shape[0]
+    assert theta_per_ray.shape[0] == D_hf.shape[0], "HF angle count must equal HF ray rows"
+    assert integ_hf.shape[0]      == D_hf.shape[0], "HF integration times must equal HF ray rows"
+    assert D_all.shape[0] == vtec_all.shape[0], "Row count of D_all must match len(vtec_all)"
+    assert D_vhf.shape[0] + D_hf.shape[0] == D_all.shape[0], "Combined row count mismatch"
+
+    # Sanity checks on combined shapes
+    assert D_all.shape[0] == vtec_all.shape[0], "Row count of D_all must match len(vtec_all)"
+    assert D_vhf.shape[0] + D_hf.shape[0] == D_all.shape[0], "Combined row count mismatch"
+        # D_all_gpu = cpx_sparse.csr_matrix(D_all)
+
+    # tec_true, vtec_hf, delta_t_hf = step3_forward_model_gpu(
+    # iono=iono, lats=lats, alts_m=alts_m,
+    # D_hf=D_hf,
+    # theta_per_ray=theta_per_ray,
+    # integ_hf=integ_hf,
+    # f_c_hf=F_C_HF, bw_hf=BW_HF
+    # )
+    # # VHF path (CPU; cheap)
+    # stec_vhf = np.array([compute_STEC_along_path(iono, lats, alts_m, ray) for ray in rays_vhf])
+    # vtec_vhf, delta_t_vhf = dualfreq_to_VTEC(
+    #     stec_slant=stec_vhf,
+    #     f_c=F_C_VHF,
+    #     bw=BW_VHF,
+    #     theta_deg=0.0,
+    #     integration_time=integ_vhf,
+    #     return_deltat=True
+    # )
 
     if TEST_CHECKS:
         # === Step 3 math checks (mirrors unit_test) ===
@@ -1735,6 +1877,17 @@ def run_pipeline():
     plot_ray_coverage_heatmap(D_hf, lats, alts_m, "HF ray coverage")
     plot_ray_coverage_heatmap(D_vhf, lats, alts_m, "VHF ray coverage")
 
+    # --- Reconstruction-free TEC-error θ–e surface (noise-free passive HF estimate)
+    try:
+        theta_vals_tec, e_vals_tec, heat_tec = theta_e_surface_tecerr(
+            alt_km_1d, Ne_1d, D_hf, rays_hf, theta_per_ray, integ_hf,
+            lats_base=lats, alts_m_base=alts_m,
+            e_values=np.linspace(0.01, 0.625, 25),
+            out_png=os.path.join(IMG_DIR, "Z_theta_e_surface_tecerr.png")
+        )
+    except Exception as ex:
+        print(f"[θ–e] Passive TEC-error surface generation failed: {ex}")
+
     # Step 5A (ARTs) + collect for weighted
     print("Step 5: Reconstruct")
     Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, D_all, vtec_all = step5_reconstruct(
@@ -1762,6 +1915,21 @@ def run_pipeline():
         n_lat=len(lats), n_alt=len(alts_m), n_iters=50, relax=0.2
     )
 
+    # --- Post-solve global gain correction ---
+    y_pred = D_all @ Ne_rec_weighted.ravel(order="C")   # predicted slant TEC
+    denom  = float(y_pred @ y_pred) if (y_pred is not None) else 0.0
+    if denom > 0:
+        gain = float(y_pred @ vtec_all) / denom         # LS scalar
+        Ne_rec_weighted *= gain
+        print(f"[GAIN] Applied global scale = {gain:.3e}")
+    else:
+        print("[GAIN] skipped (zero denominator)")
+
+    colsum = np.array(D_all.sum(axis=0)).ravel()  # path length accumulated per voxel
+    print(f"[UNITS] median column-sum (m): {np.median(colsum):.3e}, max: {colsum.max():.3e}")
+
+
+
     Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
         D_all, vtec_all, weights,
         n_lat=len(lats), n_alt=len(alts_m),
@@ -1786,7 +1954,7 @@ def run_pipeline():
     truth_alt_lat = iono
     rec_all_alt_lat = Ne_rec_all
     rec_w_alt_lat   = Ne_rec_weighted
-    plot_recon_cross_sections(lats, alts_m, iono.T, Ne_rec_all, Ne_rec_weighted)
+    plot_recon_cross_sections(lats, alts_m, iono, Ne_rec_all, Ne_rec_weighted)
     plot_voxel_uncertainty_proxy(D_all, lats, alts_m)
 
     # Step 6 (plots)
@@ -1835,6 +2003,7 @@ def run_pipeline():
         plot_passive_tec_error_heatmap_GPU(t_meas, tec_for_bin, delta_tec_err_passive, smooth_sigma=1.2)
         plot_vhf_range_error_heatmap_GPU(t_meas, tec_for_bin, range_error_after_passive, smooth_sigma=1.2)
 
+    plt.close("all")
     # --- Peters Fig. 7 validation surface ---
     angles_deg, ecc_vec, TEC_err = peters_theta_tecerror_surface(
         e_vec=np.linspace(0.01, 0.99, 200), ra=4e15, n_x=1000
@@ -1850,20 +2019,65 @@ def run_pipeline():
     VTEC_dTEC = (dt_dTEC*2*np.pi) * ((F_C_HF**2)*(F_C_VHF**2)) / (1.69e-6*((F_C_VHF**2)-(F_C_HF**2)))
     print(f"[Peters demo] dTEC={dTEC:.3e}, dt_true={dt_true:.3e}s, dt_error={dt_error:.3e}s, dt_dTEC={dt_dTEC:.3e}s, VTEC_dTEC={VTEC_dTEC:.3e}")
 
-    # Example call near the end of run_pipeline():
-    print("Building θ–e surface from reconstruction (quick sweep)…")
-    theta_vals, e_vals, heat = recon_theta_e_surface(
-        alt_km_1d, Ne_1d,
-        rays_hf=rays_hf,                 # reuse your current HF geometry
-        theta_per_ray=theta_per_ray,
-        integ_hf=integ_hf,
-        lats_base=lats,
-        alts_m_base=alts_m,
-        e_vec=np.linspace(0.0, 0.6, 15), # fewer rows for speed
-        n_iters=8, relax=0.15,
-        use_weighted=True,
-        out_png=os.path.join(IMG_DIR, "Z_recon_theta_e_surface.png")
+    # --- Reconstruction-derived θ–e surface ---
+    theta_vals = THETA_LIST_HF #np.arange(5.0, 16.5, 0.5)        # center of θ bins, deg from vertical (adjust as you wish)
+    e_vals     = np.linspace(0.0, 0.62, 32)       # eccentricity sweep
+
+    # --- Build a tiny raypack builder for any requested theta ---
+    def _hf_raypack_builder(theta_deg: float):
+        return trace_passive_oblique(
+            sat_lats=SAT_LATS_HF,
+            h0_m=alts_m.max(),
+            hsat_m=alts_m.max(),
+            theta_i_deg=float(theta_deg),
+            npts=NPTS_HF,
+            R_E_m=1.5608e6,
+            mode=RAY_TRACE_MODE,
+            lat_left_deg=0.0,
+        )
+
+    # --- Simple solver wrapper (few iters so the sweep is quick) ---
+    def _solver_fn(D_all, y_all, lats_, alts_m_, max_iters=4):
+        return reconstruct_art_sparse(D_all, y_all, len(lats_), len(alts_m_), max_iters, RELAX)
+
+    # OPTIONAL: toy ΔTEC(θ,e) to imprint the Peters-like trend
+    def _toy_dtec(theta_deg, e):
+        # gentle rise with θ and e; tune as needed
+        return 2.0e13 * (e / 0.625) * np.clip((theta_deg - 5.0) / 40.0, 0.0, 1.0)
+
+    theta_vals = THETA_LIST_HF
+    e_vals     = np.linspace(0.0, 0.62, 32)
+
+    th_axis, e_axis, heat = recon_theta_e_surface(
+        theta_vals_deg=theta_vals,
+        e_vals=e_vals,
+        base_truth_Ne=iono,                 # e=0 truth you already built
+        hf_raypack_builder=_hf_raypack_builder,
+        D_vhf=D_vhf,
+        lats=lats, alts_m=alts_m,
+        solver_fn=_solver_fn,
+        mode="vhf_plus_hf_toy",             # use "vhf_only" if you want to sanity-check first
+        toy_dtec_fn=_toy_dtec,              # or None for vhf_only mode
+        n_iter_hint=4
     )
+
+    fig, ax = plt.subplots(figsize=(10, 7.5))
+    im = ax.imshow(heat, origin="lower", aspect="auto",
+                extent=[th_axis[0], th_axis[-1], e_axis[0], e_axis[-1]],
+                cmap="magma")
+    cbar = plt.colorbar(im, ax=ax); cbar.set_label("Residual (m$^{-2}$)")
+    ax.set_xlabel("Incidence angle θ (deg from vertical)")
+    ax.set_ylabel("Ionosphere Eccentricity")
+    ax.set_title("Maximum Incidence Angle for TEC Error (Reconstruction)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(IMG_DIR, "Z_recon_theta_e_surface.png"), dpi=160)
+    plt.close(fig)
+
+
+    # Acceptance prints
+    print(f"theta_vals: min={theta_vals.min():.1f}, max={theta_vals.max():.1f}, n={len(theta_vals)}")
+    print(f"e_vals: min={e_vals.min():.2f}, max={e_vals.max():.2f}, n={len(e_vals)}")
+    print(f"heat.shape = {heat.shape}")
 
 
     return {

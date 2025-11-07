@@ -32,6 +32,8 @@ from improved_geometry import (
     weighted_reconstruction_art
 )
 
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
+
 # ---------------------- Config -----------------------
 # VHF & HF radio parameters (same conventions as your current main)
 F_C_VHF = 60e6        # VHF center frequency [Hz]
@@ -55,8 +57,7 @@ INTEG_TIMES_HF_PER_ANGLE = np.array([0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14])
 N_ITERS = 20
 RELAX   = 0.1
 
-# Some constants
-C = 3e8  # speed of light [m/s]
+# Use physics_constants for canonical values (C_LIGHT, C_IONO)
 
 # ---------------------- Step 0: Load data ----------------------
 def step0_load_dataframe(path="new_mission_df.pkl", mission_name="E6a Exit"):
@@ -353,8 +354,8 @@ def build_passive_plot_inputs(
     delta_t_vhf_matched = np.full_like(delta_t_hf, delta_t_vhf[vhf_idx])
 
     delta_dt = -(delta_t_vhf_matched - delta_t_hf)                  # seconds
-    tec_residual_after_passive = (C * delta_dt / 40.3) * freq_factor_h   # m^-2
-    range_error_after_passive = (40.3 / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
+    tec_residual_after_passive = (C_LIGHT * delta_dt / C_IONO) * freq_factor_h   # m^-2
+    range_error_after_passive = (C_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
 
     return t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive
 
@@ -455,13 +456,13 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
     delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
 
     # Convert δ(Δt) to TEC with the HF frequency pair
-    c = 3e8
+    c = C_LIGHT
     f1_h = f_c_hf - 0.5*bw_hf
     f2_h = f_c_hf + 0.5*bw_hf
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     delta_dt_all = -(delta_t_vhf_matched - delta_t_hf)
-    tec_est_ddt_all = (c * delta_dt_all / 80.6) * freq_factor_h
+    tec_est_ddt_all = (c * delta_dt_all / C_IONO) * freq_factor_h
 
     Ne_rec_ddt = reconstruct_art(D_hf, tec_est_ddt_all, len(lats), len(alts_m), n_iters, relax)
     return Ne_rec_ddt

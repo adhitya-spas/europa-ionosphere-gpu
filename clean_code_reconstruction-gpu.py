@@ -36,6 +36,8 @@ from improved_geometry import (
     weighted_reconstruction_art_sparse
 )
 
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
+
 # ---------------------- Config -----------------------
 # VHF & HF radio parameters (same conventions as your current main)
 F_C_VHF = 60e6        # VHF center frequency [Hz]
@@ -61,9 +63,7 @@ INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, 20)  # 20 values from 0.05s t
 N_ITERS = 20
 RELAX   = 0.1
 
-# Some constants
-C = 3e8  # speed of light [m/s]
-K_IONO = 40.3  # ionospheric delay constant in SI: Δt = K_IONO * TEC / (c f^2)
+# Use physics constants from physics_constants
 
 # ---------------------- Step -1: GPU SUBSTITUTES ----------------------
 USE_GPU = True
@@ -117,7 +117,7 @@ def build_passive_plot_inputs_GPU(
     delta_tec_abs_gpu = cp.abs(stec_est_gpu - tec_true_gpu)
 
     # ---- 3B) δ(Δt) residual → TEC → VHF range error ----
-    c = cp.asarray(3e8, dtype=cp.float32)
+    c = cp.asarray(C_LIGHT, dtype=cp.float32)
     f1_h = cp.asarray(F_C_HF - 0.5*BW_HF, dtype=cp.float32)
     f2_h = cp.asarray(F_C_HF + 0.5*BW_HF, dtype=cp.float32)
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
@@ -129,8 +129,8 @@ def build_passive_plot_inputs_GPU(
     dt_vhf_match_gpu = cp.full_like(dt_hf_gpu, dt_vhf_gpu[vhf_idx])
     delta_dt_gpu = -(dt_vhf_match_gpu - dt_hf_gpu)
 
-    tec_residual_gpu = (c * delta_dt_gpu / K_IONO) * freq_factor_h    # m^-2
-    range_err_gpu    = (K_IONO / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
+    tec_residual_gpu = (c * delta_dt_gpu / cp.asarray(C_IONO, dtype=cp.float32)) * freq_factor_h    # m^-2
+    range_err_gpu    = (cp.asarray(C_IONO, dtype=cp.float32) / (cp.asarray(F_C_VHF, dtype=cp.float32)**2)) * cp.abs(tec_residual_gpu)
 
     # ---- Return NumPy for plotting, keep GPU speed for compute ----
     t_meas      = cp.asnumpy(integ_gpu)
@@ -597,8 +597,9 @@ def build_passive_plot_inputs(
     delta_t_vhf_matched = np.full_like(delta_t_hf, delta_t_vhf[vhf_idx])
 
     delta_dt = -(delta_t_vhf_matched - delta_t_hf)                  # seconds
-    tec_residual_after_passive = (C * delta_dt / K_IONO) * freq_factor_h   # m^-2
-    range_error_after_passive = (K_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
+    # Use canonical constants
+    tec_residual_after_passive = (C_LIGHT * delta_dt / C_IONO) * freq_factor_h   # m^-2
+    range_error_after_passive = (C_IONO / (F_C_VHF**2)) * np.abs(tec_residual_after_passive)  # meters
 
     return t_meas, tec_for_bin, delta_tec_err_passive, range_error_after_passive
 
@@ -748,15 +749,15 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
     origin_lat_idx = int(np.argmin(np.abs(sat_lats_vhf - origin_lat)))
     delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
 
-    # Convert δ(Δt) to TEC with the HF frequency pair
-    c = 3e8
-    f1_h = f_c_hf - 0.5*bw_hf
-    f2_h = f_c_hf + 0.5*bw_hf
+    # Convert δ(Δt) to TEC with the HF frequency pair using canonical constants
+    f1_h = f_c_hf - 0.5 * bw_hf
+    f2_h = f_c_hf + 0.5 * bw_hf
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     delta_dt_all = -(delta_t_vhf_matched - delta_t_hf)
-    tec_est_ddt_all = (c * delta_dt_all / K_IONO) * freq_factor_h
-    # tec_est_ddt_all = (c * delta_dt_all / 80.6) * freq_factor_h
+    # Use C_LIGHT and C_IONO from physics_constants for the inverse relation:
+    # TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
+    tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h
 
     Ne_rec_ddt = reconstruct_art_sparse(D_hf, tec_est_ddt_all, len(lats), len(alts_m), n_iters, relax)
     return Ne_rec_ddt

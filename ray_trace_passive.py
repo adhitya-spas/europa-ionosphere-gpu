@@ -5,16 +5,17 @@ import numpy as np
 from typing import Union, Tuple
 import scipy.sparse as sp
 
-R_E = 1569e3  # Europa radius in m
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
 
-def pack_rays_mid_ds(ray_paths, R_E=1569e3):
+def pack_rays_mid_ds(ray_paths, R_E=None):
     """
     Convert list of [N_i x 2] rays (lat[deg], alt[m]) into padded arrays:
       lat_mid [n_rays, max_seg], alt_mid [..], ds_m [..], seg_counts [n_rays]
     where each 'segment' is between consecutive samples of a ray.
     """
     import numpy as np
-    deg2m = (np.pi / 180.0) * R_E
+    if R_E is None:
+        R_E = R_EUROPA
 
     n = len(ray_paths)
     seg_counts = np.array([max(0, p.shape[0] - 1) for p in ray_paths], dtype=np.int32)
@@ -28,13 +29,16 @@ def pack_rays_mid_ds(ray_paths, R_E=1569e3):
         m = seg_counts[i]
         if m == 0: 
             continue
-        lat0 = path[:-1, 0]; lat1 = path[1:, 0]
-        alt0 = path[:-1, 1]; alt1 = path[1:, 1]
-        lat_mid[i, :m] = 0.5 * (lat0 + lat1)
-        alt_mid[i, :m] = 0.5 * (alt0 + alt1)
-        dlat_m = (lat1 - lat0) * deg2m
-        dalt_m = (alt1 - alt0)
-        ds_m[i, :m] = np.hypot(dlat_m, dalt_m)
+    lat0 = path[:-1, 0]; lat1 = path[1:, 0]
+    alt0 = path[:-1, 1]; alt1 = path[1:, 1]
+    lat_mid[i, :m] = 0.5 * (lat0 + lat1)
+    alt_mid[i, :m] = 0.5 * (alt0 + alt1)
+    # compute local radius at segment midpoint and convert degrees->meters per segment
+    Rloc = R_E + 0.5 * (alt0 + alt1)
+    deg2m_seg = (np.pi / 180.0) * Rloc
+    dlat_m = (lat1 - lat0) * deg2m_seg
+    dalt_m = (alt1 - alt0)
+    ds_m[i, :m] = np.hypot(dlat_m, dalt_m)
 
     return lat_mid, alt_mid, ds_m, seg_counts
 
@@ -63,7 +67,7 @@ def trace_passive_oblique_old(
     hsat: float,
     theta_i_deg: float,  # TRUE incidence angle from vertical
     npts: int = 200,
-    R_E: float = 6.371e6
+    R_E: float = None
 ) -> list[np.ndarray]:
     """
     Generate oblique two-leg ray paths for each satellite ground-track latitude:
@@ -73,6 +77,8 @@ def trace_passive_oblique_old(
     theta_i_deg: TRUE incidence angle from vertical (0 = nadir, 90 = horizontal)
     """
     theta = np.deg2rad(theta_i_deg)
+    if R_E is None:
+        R_E = R_EUROPA
     deg_per_m = 180.0 / (np.pi * R_E)
     paths = []
 
@@ -126,6 +132,8 @@ def trace_passive_oblique_old2(
     theta_i_deg: TRUE incidence angle from vertical (0 = nadir, 90 = horizontal)
     """
     theta = np.deg2rad(theta_i_deg)
+    if R_E is None:
+        R_E = R_EUROPA
     deg_per_m = 180.0 / (np.pi * R_E)
     paths = []
 
@@ -169,7 +177,7 @@ def trace_passive_oblique(
     hsat_m: float,
     theta_i_deg: float,     # TRUE incidence (deg from vertical)
     npts: int = 200,
-    R_E_m: float = 1.5608e6,  # Europa radius in meters
+    R_E_m: float | None = None,  # Europa radius in meters (defaults to physics_constants.R_EUROPA)
     *,
     mode: str = "sat_right",  # "sat_right" (old behavior) or "left_fixed"
     lat_left_deg: float | None = None
@@ -192,9 +200,12 @@ def trace_passive_oblique(
     list[np.ndarray], each array shaped (npts, 2) with columns = [lat_deg, alt_m]
     """
     if mode not in ("sat_right", "left_fixed","mirror"):
+        print(f"Invalid mode: {mode}")
         raise ValueError("mode must be 'sat_right' or 'left_fixed' or 'mirror'")
 
     theta = np.deg2rad(theta_i_deg)
+    if R_E_m is None:
+        R_E_m = R_EUROPA
     deg_per_m = 180.0 / (np.pi * R_E_m)  # convert horizontal meters → degrees latitude
 
     paths: list[np.ndarray] = []
@@ -290,15 +301,17 @@ def compute_STEC_along_path(
     ds ≈ sqrt((d_lat·deg2m)**2 + d_alt**2)
     Follows Eqn A.12 in the paper. 
     """
-    deg2m = (np.pi/180.0)*R_E
-    stec  = 0.0
+    stec = 0.0
     for (lat0, alt0), (lat1, alt1) in zip(path[:-1], path[1:]):
         i_lat = int(np.argmin(np.abs(lats - lat0)))
         i_alt = int(np.argmin(np.abs(alts - alt0)))
-        dlat  = (lat1 - lat0)*deg2m
+        # local conversion degrees->meters at segment midpoint
+        Rloc = R_EUROPA + 0.5 * (alt0 + alt1)
+        deg2m = (np.pi / 180.0) * Rloc
+        dlat  = (lat1 - lat0) * deg2m
         dalt  = alt1 - alt0
         ds    = np.hypot(dlat, dalt)
-        stec += ionosphere[i_alt, i_lat]*ds
+        stec += ionosphere[i_alt, i_lat] * ds
     return stec
 
 def dualfreq_to_VTEC_old(
@@ -311,23 +324,24 @@ def dualfreq_to_VTEC_old(
     Dual-frequency TEC estimate (Peters et al. Eq. 9):
     1) f1 = f_c - bw/2, f2 = f_c + bw/2
     2) Compute group delay difference: Δt = C·STEC·(1/f1² − 1/f2²)
-    3) Invert Eq. 9: TEC = (c·Δt/80.6)·[f1² f2²/(f2²−f1²)]
+    3) Invert Eq. 9: TEC = (C_LIGHT·Δt/C_IONO)·[f1² f2²/(f2²−f1²)]  (legacy numeric 80.6 removed; repo uses `physics_constants.C_IONO`)
     [basically c*stec_slant = TEC because we simulate delta_t]
     4) Verticalize via cos(theta)
     """
-    C = 40.3   # group-delay constant [m^3/s^2] - two-way
-    c = 3e8    # speed of light [m/s]
+    # Legacy variant retained only to avoid breaking imports. Use dualfreq_to_VTEC.
+    raise NotImplementedError("dualfreq_to_VTEC_old is deprecated: use dualfreq_to_VTEC which uses physics_constants")
     f1 = f_c - bw/2.0
     f2 = f_c + bw/2.0
 
-    # Step 2: Compute group delay difference (Eq. 14, Kintner and Ledvina (2005)) [In reality, this is the data we receive from the receiver]
-    delta_t = C * stec_slant * (1.0 / f1**2 - 1.0 / f2**2)
+    # Step 2: Compute group delay difference (Eq. 14). Use canonical iono constant
+    # delta_t = (C_IONO / C_LIGHT) * stec_slant * (1.0 / f1**2 - 1.0 / f2**2)
+    delta_t = C_IONO * stec_slant * (1.0 / f1**2 - 1.0 / f2**2)
     # try using integration time here from the plot:
     # delta_t = 1
     
-    # Step 3: Invert Eq. 9 to get TEC
+    # Step 3: Invert Eq. 9 to get TEC (use canonical constants)
     freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
-    TEC = (c * delta_t / 80.6) * freq_factor
+    TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
 
     # Step 4: Verticalize
     theta = np.deg2rad(theta_deg)
@@ -346,18 +360,18 @@ def dualfreq_to_VTEC_old2(
     Dual-frequency TEC estimate (Peters et al. Eq. 9):
     1) f1 = f_c - bw/2, f2 = f_c + bw/2
     2) Compute group delay difference: Δt = C·STEC·(1/f1² − 1/f2²)
-    3) Invert Eq. 9: TEC = (c·Δt/80.6)·[f1² f2²/(f2²−f1²)]
+    3) Invert Eq. 9: TEC = (C_LIGHT·Δt/C_IONO)·[f1² f2²/(f2²−f1²)]  (legacy numeric 80.6 removed; repo uses `physics_constants.C_IONO`)
     [basically c*stec_slant = TEC because we simulate delta_t]
     4) Verticalize via cos(theta)
     """
-    C = 80.6   # group-delay constant [m^3/s^2] - two-way
-    c = 3e8    # speed of light [m/s]
+    raise NotImplementedError("dualfreq_to_VTEC_old2 is deprecated: use dualfreq_to_VTEC")
     f1 = f_c - bw/2.0
     f2 = f_c + bw/2.0
 
     # Step 2: Compute group delay difference (Eq. 14, Kintner and Ledvina (2005)) [In reality, this is the data we receive from the receiver]
     inv_freq_diff = (1.0 / f1**2 - 1.0 / f2**2)
-    delta_t = (C / c) * stec_slant * inv_freq_diff
+    # forward model (legacy variant) using canonical constants
+    delta_t = (C_IONO / C_LIGHT) * stec_slant * inv_freq_diff
 
     # Integration time-dependent delay noise
     base_noise_scale = 2e-7  # matches ~0.2 µs error at 0.1 s and 1 MHz
@@ -365,7 +379,7 @@ def dualfreq_to_VTEC_old2(
     delta_t += np.random.normal(0, sigma_dt, size=delta_t.shape)
 
     freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
-    TEC = (c * delta_t / 80.6) * freq_factor
+    TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
 
     # Step 4: Verticalize
     theta = np.deg2rad(theta_deg)
@@ -398,21 +412,28 @@ def dualfreq_to_VTEC(
     Returns:
         VTEC or (VTEC, Δt) depending on return_deltat
     """
-    C = 40.3 #80.6   # group-delay constant [m^3/s^2]
-    c = 3e8    # speed of light [m/s]
+    # Use constants from physics_constants for a single source-of-truth
+    C = C_IONO
+    c = C_LIGHT
     f1 = f_c - bw / 2.0
     f2 = f_c + bw / 2.0
 
-    # Step 1: group delay difference from Eq. 14 (Kintner and Ledvina)
+    st = np.asarray(stec_slant, dtype=float)
+    theta_arr = np.broadcast_to(np.atleast_1d(theta_deg).astype(float), st.shape)
+    Tint_arr  = np.broadcast_to(np.atleast_1d(integration_time).astype(float), st.shape)
+
+    # Step 1: group delay difference from slant TEC (forward model)
     inv_freq_diff = (1.0 / f1**2 - 1.0 / f2**2)
+    # delta_t = (C_IONO / C_LIGHT) * STEC * (1/f1^2 - 1/f2^2)
     delta_t = (C / c) * stec_slant * inv_freq_diff
 
     # Step 2: simulate timing error from matched filter theory (Appendix B)
-    sigma_dt = 1.0 / (2 * np.pi * bw * np.sqrt(integration_time) * snr_linear)
-    delta_t += np.random.normal(0, sigma_dt, size=delta_t.shape)
+    sigma_dt  = 1.0 / (2 * np.pi * bw * np.sqrt(Tint_arr) * snr_linear)
+    delta_t  += np.random.normal(0.0, 1.0, size=st.shape) * sigma_dt
 
     # Step 3: TEC inversion (Eq. 9)
     freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
+    # TEC inversion: TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
     TEC = (c * delta_t / C) * freq_factor
 
     # Step 4: Verticalize to get VTEC
@@ -608,15 +629,17 @@ def trace_rays(ionosphere, lats, alts, tx_lats, sat_lats, npts=500):
 
 def invert_delay(delta_t, theta_deg,
                  f1=8.5e6, f2=9.5e6,    # HF twin-frequencies
-                 c=3e8):                # speed of light
+                 c=None):                # speed of light
     """
     Given a delay difference delta_t (s) at incidence angle theta_deg (°),
     returns the vertical TEC estimate (m^-2).
     """
     # 1) frequency factor from Peters Eq. 9
+    if c is None:
+        c = C_LIGHT
     freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
-    # 2) raw slant TEC from delay (Peters Eq. 6)
-    tec_slant = (c * delta_t / 40.3) * freq_factor #(c * delta_t / 80.6) * freq_factor
+    # raw slant TEC from delay (unified): TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
+    tec_slant = (c * delta_t / C_IONO) * freq_factor
     # 3) map to vertical TEC (Appendix A / Eq. A.13)
     tec_vertical = tec_slant * np.cos(np.radians(theta_deg))
     return tec_vertical

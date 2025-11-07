@@ -2,6 +2,7 @@
 
 import numpy as np
 from scipy import sparse as sp
+from physics_constants import R_EUROPA
 
 
 def build_geometry_matrix_weighted_sparse(rays, lats, alts_m, dtype=np.float32):
@@ -16,8 +17,7 @@ def build_geometry_matrix_weighted_sparse(rays, lats, alts_m, dtype=np.float32):
     n_pix = n_lat * n_alt
     n_rays = len(rays)
 
-    R_E = 1569e3  # Europa radius (m) -- keep your body radius
-    deg2m = (np.pi/180.0) * R_E
+    # use Europa radius from physics_constants and compute deg->m per segment
 
     rows = []
     cols = []
@@ -39,8 +39,10 @@ def build_geometry_matrix_weighted_sparse(rays, lats, alts_m, dtype=np.float32):
             jh = int(np.argmin(np.abs(alts_m  - alt_mid)))
 
             if 0 <= jφ < n_lat and 0 <= jh < n_alt:
-                # segment length (meters)
-                dlat_m = (lat1 - lat0) * deg2m
+                # segment length (meters); compute local radius at midpoint
+                Rloc = R_EUROPA + 0.5*(alt0 + alt1)
+                deg2m_local = (np.pi/180.0) * Rloc
+                dlat_m = (lat1 - lat0) * deg2m_local
                 dalt_m = (alt1 - alt0)
                 ds = float(np.hypot(dlat_m, dalt_m))
 
@@ -82,8 +84,7 @@ def build_geometry_matrix_weighted(rays, lats, alts_m):
     n_rays = len(rays)
     
     D = np.zeros((n_rays, n_pix))
-    R_E = 1569e3  # Europa radius in m
-    deg2m = (np.pi/180.0) * R_E
+    # Use Europa radius from physics_constants; compute deg->m per segment when needed
     
     for i, ray in enumerate(rays):
         # Process each segment of the ray path
@@ -98,8 +99,10 @@ def build_geometry_matrix_weighted(rays, lats, alts_m):
             jφ = int(np.argmin(np.abs(lats - lat_mid)))
             jh = int(np.argmin(np.abs(alts_m - alt_mid)))
             
-            # Calculate path length through this segment
-            dlat = (lat1 - lat0) * deg2m
+            # Calculate path length through this segment using local radius
+            Rloc = R_EUROPA + 0.5*(alt0 + alt1)
+            deg2m_local = (np.pi/180.0) * Rloc
+            dlat = (lat1 - lat0) * deg2m_local
             dalt = alt1 - alt0
             path_length = np.hypot(dlat, dalt)
             
@@ -184,35 +187,28 @@ def weighted_reconstruction_art(D, vtec_measurements, measurement_weights,
                 Ne += relax * weight * residual / denom * Di
     
     return Ne.reshape((n_alt, n_lat))
-
 def calculate_measurement_weights(integration_times, bandwidths, snr_values=None):
     """
-    Calculate measurement weights based on integration time and bandwidth.
-    Higher integration time and bandwidth = lower noise = higher weight.
-    
-    Parameters:
-    -----------
-    integration_times : np.ndarray
-        Integration time for each measurement (seconds)
-    bandwidths : np.ndarray
-        Bandwidth for each measurement (Hz)
-    snr_values : np.ndarray, optional
-        SNR for each measurement (linear scale)
-        
-    Returns:
-    --------
-    weights : np.ndarray
-        Normalized weights (higher = more reliable measurement)
+    Calculate per-measurement weights ∝ sqrt(BW * T * SNR).
+    Returns weights normalized to mean = 1.
     """
+    import numpy as np
+
+    integration_times = np.asarray(integration_times, dtype=float)
+    bandwidths       = np.asarray(bandwidths, dtype=float)
+
     if snr_values is None:
-        snr_values = np.ones_like(integration_times)
-    
-    # Weight proportional to sqrt(BW * T * SNR) - from noise theory
+        snr_values = np.ones_like(integration_times, dtype=float)
+    else:
+        snr_values = np.asarray(snr_values, dtype=float)
+
+    # Guardrails
+    integration_times = np.clip(integration_times, 1e-6, None)
+    bandwidths        = np.clip(bandwidths,        0.0,  None)
+    snr_values        = np.clip(snr_values,        1e-6, None)
+
     weights = np.sqrt(bandwidths * integration_times * snr_values)
-    
-    # Normalize weights to have mean = 1
     weights = weights / np.mean(weights)
-    
     return weights
 
 # ===================================================================

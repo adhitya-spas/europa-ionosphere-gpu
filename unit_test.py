@@ -23,6 +23,8 @@ from improved_geometry import (
     weighted_reconstruction_art_sparse
 )
 
+from physics_constants import C_LIGHT, C_IONO, R_EUROPA
+
 # ---------------------- Config -----------------------
 # VHF & HF radio parameters (same conventions as your current main)
 F_C_VHF = 60e6        # VHF center frequency [Hz]
@@ -49,9 +51,7 @@ INTEG_TIMES_HF_PER_ANGLE = np.linspace(0.05, 0.15, len(THETA_LIST_HF))  # 20 val
 N_ITERS = 20
 RELAX   = 0.1
 
-# Some constants
-C = 3e8  # speed of light [m/s]
-K_IONO = 40.3  # ionospheric delay constant in SI: Δt = K_IONO * TEC / (c f^2)
+# Use physics_constants for canonical physical values
 
 # Create one timestamped folder per process start
 IMG_TS = datetime.now().strftime("%m_%d_%H_%M_%S")
@@ -396,14 +396,14 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
     delta_t_vhf_matched = np.full(len(delta_t_hf), delta_t_vhf[origin_lat_idx])
 
     # Convert δ(Δt) to TEC with the HF frequency pair
-    c = 3e8
+    c = C_LIGHT
     f1_h = f_c_hf - 0.5*bw_hf
     f2_h = f_c_hf + 0.5*bw_hf
     freq_factor_h = (f1_h**2 * f2_h**2) / (f2_h**2 - f1_h**2)
 
     delta_dt_all = -(delta_t_vhf_matched - delta_t_hf)
-    tec_est_ddt_all = (c * delta_dt_all / K_IONO) * freq_factor_h
-    # tec_est_ddt_all = (c * delta_dt_all / 80.6) * freq_factor_h
+    tec_est_ddt_all = (c * delta_dt_all / C_IONO) * freq_factor_h
+    # (legacy) tec_est_ddt_all = (C_LIGHT * delta_dt_all / C_IONO) * freq_factor_h  # use `physics_constants` in code
 
     Ne_rec_ddt = reconstruct_art_sparse(D_hf, tec_est_ddt_all, len(lats), len(alts_m), n_iters, relax)
     return Ne_rec_ddt

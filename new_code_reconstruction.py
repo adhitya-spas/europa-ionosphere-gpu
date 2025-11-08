@@ -24,7 +24,8 @@ from improved_geometry import (
     weighted_reconstruction_art,
     weighted_reconstruction_art_sparse
 )
-from plot_scripts import plot_raypaths, plot_ionosphere_and_enhancement, plot_recons
+from plot_scripts import plot_raypaths, plot_ionosphere_and_enhancement, plot_recons, _print_ne_stats
+
 USE_GPU = True
 try:
     import cupy as cp
@@ -139,13 +140,11 @@ def generate_ray_paths(s_no, sat_lats_vhf, alts_m, npts_vhf,
         theta_per_ray = theta_rep
         integ_hf_per_ray = np.array(integ_rep, dtype=float)
 
-
     # Build Geometry Matrices
     # Use the latitude grid `lats` (not satellite lat arrays) so columns match ionosphere pixels
     D_vhf = build_geometry_matrix_weighted_sparse(rays_vhf, lats, alts_m, dtype=np.float32)
     D_hf  = build_geometry_matrix_weighted_sparse(rays_hf,  lats, alts_m, dtype=np.float32)
     D_all = scipy.sparse.vstack([D_vhf, D_hf], format="csr")
-    # D_all_gpu = cpx_sparse.csr_matrix(D_all)
 
     # HF path (GPU)
     # Push ionosphere to GPU and validate shapes
@@ -210,7 +209,8 @@ def generate_ray_paths(s_no, sat_lats_vhf, alts_m, npts_vhf,
         print("VHF STEC (first 5):", stec_vhf[:5])
         print("VHF VTEC (first 5):", vtec_vhf[:5])
 
-    return rays_vhf, rays_hf, D_all, vtec_vhf, vtec_hf, delta_t_vhf, delta_t_hf, D_vhf, D_hf
+    # NOTE: return per-ray θ and T so downstream stays aligned with D_hf
+    return rays_vhf, rays_hf, D_all, vtec_vhf, vtec_hf, delta_t_vhf, delta_t_hf, D_vhf, D_hf, np.asarray(theta_per_ray, float), np.asarray(integ_hf_per_ray, float)
 
 # ---------------------- Step 3: Forward Model (GPU) -----------------------
 def forward_model_gpu(
@@ -222,18 +222,11 @@ def forward_model_gpu(
 ):
     if not USE_GPU:
         raise RuntimeError("CuPy not available; use the CPU path or set USE_GPU=True.")
-
-    # ---- Push ionosphere to GPU and vectorize ----
-    iono_gpu = cp.asarray(iono, dtype=cp.float32)          # (n_alt, n_lat)
-    x_gpu = iono_gpu.ravel(order="C")                      # (n_pix,)
-
-    assert D_hf_gpu.shape[0] == tec_true_gpu.shape[0]
-
-    # ---- Geometry to GPU (sparse preferred) ----
-    if hasattr(D_hf, "tocsr"):  # SciPy sparse
+    iono_gpu = cp.asarray(iono, dtype=cp.float32)
+    x_gpu = iono_gpu.ravel(order="C")
+    if hasattr(D_hf, "tocsr"):
         D_hf_gpu = cpx_sparse.csr_matrix(D_hf)
     else:
-        # assume dense np.ndarray
         D_hf_gpu = cpx_sparse.csr_matrix(cp.asarray(D_hf))
 
     # ---- TEC truth: one shot on GPU ----
@@ -280,17 +273,6 @@ def step5_reconstruct(D_vhf, D_hf, vtec_vhf, vtec_hf,
         Ne_rec_all = reconstruct_art_sparse(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
     else:
         Ne_rec_all = reconstruct_art(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
-
-
-    # 5B) Weighted ART (weights ∝ √(BW·T·SNR); here SNR assumed 1 unless you pass it)
-    integ_all = np.concatenate([
-        np.full_like(vtec_vhf, INTEG_TIMES_VHF, dtype=float),
-        # NOTE: we don't have the per-ray HF T here yet; caller passes it:
-        # We'll return a closure result instead (see wrapper below)
-        # or you can pass integ_hf externally into this function.
-    ])
-
-    # We'll build weights in the wrapper where we have HF T.
     return Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, D_all, vtec_all
 
 def step4B_weighted_reconstruct(D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_VHF, bw_hf=BW_HF,
@@ -316,6 +298,15 @@ def step4B_weighted_reconstruct(D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_
         )
     return Ne_rec_weighted, weights
 
+def _rmse_from(D, x_c, y):
+    """RMSE of residuals r = D x - y."""
+    if sp.issparse(D):
+        r = D @ x_c
+    else:
+        r = D.dot(x_c)
+    r -= y
+    return float(np.sqrt(np.mean((r)**2)))
+
 def art_with_history(D, y, *, n_lat, n_alt, n_iters=20, relax=0.1, x0=None,
                      compute_lcurve=False, L=None):
     """
@@ -326,54 +317,15 @@ def art_with_history(D, y, *, n_lat, n_alt, n_iters=20, relax=0.1, x0=None,
     """
     m, n = D.shape
     x = np.zeros(n, dtype=np.float64) if x0 is None else np.asarray(x0, float).copy()
-
-    # precompute row norms for efficiency
-    # if sp.issparse(D):
-    #     row_norm2 = np.array(D.power(2).sum(axis=1)).ravel()
-    # else:
-    #     row_norm2 = np.sum(D*D, axis=1)
-    # row_norm2[row_norm2 == 0.0] = 1.0
-    # if sp.issparse(D):
-    #     # Fast CSR row access (no getrow!)
-    #     start = D.indptr[i]
-    #     end   = D.indptr[i+1]
-    #     idx   = D.indices[start:end]
-    #     vals  = D.data[start:end]
-    #     pred_i = np.dot(vals, x[idx])              # scalar
-    #     ri     = y[i] - pred_i
-    #     alpha  = relax * ri / row_norm2[i]
-    #     x[idx] += alpha * vals                      # in-place update
-    # else:
-    #     Di     = D[i, :]
-    #     pred_i = float(np.dot(Di, x))
-    #     ri     = y[i] - pred_i
-    #     alpha  = relax * ri / row_norm2[i]
-    #     x     += alpha * Di
-
-    # Ensure fast CSR layout for row-wise Kaczmarz
     if sp.issparse(D) and not sp.isspmatrix_csr(D):
         D = D.tocsr()
-
     if sp.issparse(D):
         row_norm2 = np.array(D.power(2).sum(axis=1)).ravel()
     else:
         row_norm2 = np.sum(D * D, axis=1)
     row_norm2[row_norm2 == 0.0] = 1.0
-
     rmse_hist, reg_hist = [], []
-
     for it in range(n_iters):
-        # one full sweep
-        # for i in range(m):
-        #     # r_i = y_i - <D_i, x>
-        #     Di = D.getrow(i) if sp.issparse(D) else D[i, :]
-        #     pred_i = float(Di.dot(x)) if sp.issparse(D) else float(np.dot(Di, x))
-        #     ri = y[i] - pred_i
-        #     alpha = relax * ri / row_norm2[i]
-        #     if sp.issparse(D):
-        #         x[Di.indices] += alpha * Di.data
-        #     else:
-        #         x += alpha * Di
         for i in range(m):
             if sp.issparse(D):
                 start = D.indptr[i]
@@ -390,17 +342,6 @@ def art_with_history(D, y, *, n_lat, n_alt, n_iters=20, relax=0.1, x0=None,
                 ri     = y[i] - pred_i
                 alpha  = relax * ri / row_norm2[i]
                 x     += alpha * Di
-            # Di = D.getrow(i) if sp.issparse(D) else D[i, :]
-            # pred_i = float(Di.dot(x)) if sp.issparse(D) else float(np.dot(Di, x))
-            # ri = y[i] - pred_i
-            # alpha = relax * ri / row_norm2[i]
-            # if sp.issparse(D):
-            #     # x += alpha * D_i^T
-            #     x[Di.indices] += alpha * Di.data
-            # else:
-            #     x += alpha * Di
-
-        # end of sweep: diagnostics
         rmse_hist.append(_rmse_from(D, x, y))
         if compute_lcurve:
             if L is None:
@@ -410,7 +351,6 @@ def art_with_history(D, y, *, n_lat, n_alt, n_iters=20, relax=0.1, x0=None,
                     reg_hist.append(float(np.linalg.norm(L @ x)))
                 else:
                     reg_hist.append(float(np.linalg.norm(L.dot(x))))
-
     return x.reshape(n_alt, n_lat, order="C"), rmse_hist, (reg_hist if compute_lcurve else None)
 
 def weighted_art_with_history(D, y, w, *, n_lat, n_alt, n_iters=20, relax=0.1, x0=None,
@@ -431,9 +371,7 @@ def weighted_art_with_history(D, y, w, *, n_lat, n_alt, n_iters=20, relax=0.1, x
             Ds = Ds.tocsr()
     else:
         Ds = D * sw[:, None]
-
     ys = y * sw
-
     return art_with_history(Ds, ys, n_lat=n_lat, n_alt=n_alt,
                             n_iters=n_iters, relax=relax, x0=x0,
                             compute_lcurve=compute_lcurve, L=L)
@@ -441,7 +379,7 @@ def weighted_art_with_history(D, y, w, *, n_lat, n_alt, n_iters=20, relax=0.1, x
 # ---------------------- Step 0: Correlation between theta and integration time -----------------------
 
 def plan_transect_fixed_length(theta_grid_deg, total_km,
-                               lat_start_deg, R_E_km, h_km, v_km_s):
+                               lat_start_deg, R_E_km, h_km, v_km_s): # Irregular sweeping
     """
     MODE A: Build a transect with *equal total length* for a given theta grid.
     We step through theta_grid in order (repeating if needed), compute Ti from
@@ -454,39 +392,32 @@ def plan_transect_fixed_length(theta_grid_deg, total_km,
       T_list     : np.ndarray [N],   integration time per shot (s)
     """
     r_s = R_E_km + h_km
-    K   = (2.0 * h_km) / v_km_s                 # seconds per tan(theta)
+    K   = (2.0 * h_km) / v_km_s
     sat_lats = [float(lat_start_deg)]
     theta_list = []
     T_list = []
     dist_accum = 0.0
     i = 0
-
     while dist_accum < total_km:
         theta = float(theta_grid_deg[i % len(theta_grid_deg)])
-        Ti = K * np.tan(np.radians(theta))      # seconds
-        di = v_km_s * Ti                        # km advanced this shot
+        Ti = K * np.tan(np.radians(theta))
+        di = v_km_s * Ti
         dphi_deg = (di / r_s) * (180.0 / np.pi)
-
-        # Stop if the next step would overshoot too much; otherwise take it
         if dist_accum + di > total_km:
-            # take a partial last step so the total is exact (optional)
             remain = total_km - dist_accum
             frac = remain / di if di > 0 else 0.0
             sat_lats.append(sat_lats[-1] + frac * dphi_deg)
             theta_list.append(theta)
-            T_list.append(frac * Ti)            # shorten last integration proportionally
+            T_list.append(frac * Ti)
             break
-
         sat_lats.append(sat_lats[-1] + dphi_deg)
         theta_list.append(theta)
         T_list.append(Ti)
         dist_accum += di
         i += 1
-
     return np.asarray(sat_lats), np.asarray(theta_list), np.asarray(T_list)
 
-
-def scale_angles_to_match_length(theta_grid_deg, total_km, h_km, v_km_s):
+def scale_angles_to_match_length(theta_grid_deg, total_km, h_km, v_km_s): # Regular consecutive sweeps
     """
     MODE B: Same total length *and* same number of shots by scaling angles.
     We find γ so that sum( Ti' ) = total_km / v, with Ti' = (2h/v)*tan(θ').
@@ -502,9 +433,91 @@ def scale_angles_to_match_length(theta_grid_deg, total_km, h_km, v_km_s):
     tan_new = gamma * tan_list
     theta_new = np.degrees(np.arctan(tan_new))
     K = (2.0 * h_km) / v_km_s
-    T_new = K * tan_new  # since tan_new already computed
+    T_new = K * tan_new
     return theta_new, T_new
 
+def ensure_1d(x):
+    """Return x as a 1D numpy array (None -> empty array)."""
+    if x is None:
+        return np.array([], dtype=float)
+    arr = np.atleast_1d(x).astype(float)
+    return arr
+
+def sat_lats_from_times(T_list, lat_start_deg, R_E_km, h_km, v_km_s):
+    r_s = R_E_km + h_km
+    d_km = v_km_s * np.asarray(T_list)
+    dphi = (d_km / r_s) * (180.0/np.pi)
+    lats = [lat_start_deg]
+    for step in dphi:
+        lats.append(lats[-1] + step)
+    return np.asarray(lats)
+
+def plan_transect_single_angle(theta_deg, total_km, lat_start_deg,
+                               R_E_km, h_km, v_km_s,
+                               min_shots=2, clamp_last=True):
+    """
+    Build a transect using ONE fixed HF angle (theta_deg) for all shots.
+    - Uses geometric Ti = (2h/v) * tan(theta) for each shot.
+    - Repeats that shot until we reach (or nearly reach) total_km.
+    - Optionally 'clamp_last': adjust only the *last* shot's time so that the
+      total distance matches total_km exactly (keeps theta fixed).
+    Returns: sat_lats (N+1), theta_per_ray (N), integ_per_ray (N)
+    """
+    theta_deg = float(theta_deg)
+    tan_th = np.tan(np.radians(theta_deg))
+    if tan_th <= 0:
+        raise ValueError("theta must be > 0° for a downward-looking reflection.")
+    K = (2.0 * h_km) / v_km_s                 # km / (1/tan)
+    Ti = K * tan_th                           # seconds
+    step_km = v_km_s * Ti                     # km per shot
+
+    if step_km <= 0:
+        raise ValueError("Computed step_km <= 0; check inputs.")
+
+    # Number of full shots we can place before exceeding total_km
+    N_full = int(max(min_shots, np.floor(total_km / step_km)))
+    # Distance covered by those
+    dist_full = N_full * step_km
+    remaining_km = max(0.0, total_km - dist_full)
+
+    T_list = [Ti] * N_full
+    thetas = [theta_deg] * N_full
+
+    if remaining_km > 1e-9:
+        if clamp_last:
+            # Add one final partial shot with shorter time so we exactly hit total_km
+            T_last = remaining_km / v_km_s
+            T_list.append(T_last)
+            thetas.append(theta_deg)
+        else:
+            # Leave a small shortfall (no extra partial shot)
+            pass
+
+    T_arr = np.asarray(T_list, dtype=float)
+    theta_arr = np.asarray(thetas, dtype=float)
+
+    sat_lats = sat_lats_from_times(T_arr, lat_start_deg, R_E_km, h_km, v_km_s)
+    return sat_lats, theta_arr, T_arr
+
+def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
+                    f_c_hf=F_C_HF, bw_hf=BW_HF,
+                    n_iters=N_ITERS, relax=RELAX):
+    # Combine delta_t from VHF+HF
+    delta_all = np.concatenate([delta_t_vhf, delta_t_hf])
+    # Convert Δt back to equivalent slant TEC (Eq. 9 inverted)
+    f1, f2 = f_c_hf - bw_hf/2, f_c_hf + bw_hf/2
+    freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
+    tec_slant = (C_LIGHT * delta_all / C_IONO) * freq_factor
+    # Reconstruct Ne using the same ART kernel
+    if sp.issparse(D_hf):
+        Ne_rec_dt = reconstruct_art_sparse(D_hf, tec_slant,
+                                           len(lats), len(alts_m),
+                                           n_iters, relax)
+    else:
+        Ne_rec_dt = reconstruct_art(D_hf, tec_slant,
+                                    len(lats), len(alts_m),
+                                    n_iters, relax)
+    return Ne_rec_dt
 
 # ---------------------- MAIN PIPELINE ----------------------
 def run_pipeline(s_no,
@@ -512,14 +525,17 @@ def run_pipeline(s_no,
                  sat_lats_vhf, npts_vhf,
                  sat_lats_hf, incidence_angle_deg, npts_hf,
                  integ_vhf, integ_hf):
+    print("STEP 1")
     # STEP 1: Load ionosphere and build ionosphere map
     lats, alt_km, iono = load_dataframe_and_build_ionosphere(s_no, enhancement_amplitude)
+    alts_m=alt_km*1e3
 
+    print("STEP 2")
     # STEP 2: Generate ray paths (GPU)
-    rays_vhf, rays_hf, D_all, vtec_vhf, vtec_hf, delta_t_vhf, delta_t_hf, D_vhf, D_hf = generate_ray_paths(
+    rays_vhf, rays_hf, D_all, vtec_vhf, vtec_hf, delta_t_vhf, delta_t_hf, D_vhf, D_hf, theta_per_ray, integ_hf_per_ray = generate_ray_paths(
         s_no=s_no,
         sat_lats_vhf=sat_lats_vhf,
-        alts_m=alt_km*1e3,
+        alts_m=alts_m,
         npts_vhf=npts_vhf,
         sat_lats_hf=sat_lats_hf,
         incidence_angle_deg=incidence_angle_deg,
@@ -529,45 +545,41 @@ def run_pipeline(s_no,
         iono=iono,
         lats=lats
     )
-
     print("Geometry matrices shapes:", D_vhf.shape, D_hf.shape)
-    print("incidence_angle_deg length:", len(incidence_angle_deg))
-    print("integ_hf length:", len(integ_hf))
-    assert D_hf.shape[0] == len(incidence_angle_deg) == len(integ_hf)
+    print("theta_per_ray length:", len(theta_per_ray))
+    print("integ_hf_per_ray length:", len(integ_hf_per_ray))
+    assert D_hf.shape[0] == len(theta_per_ray) == len(integ_hf_per_ray)
 
+    print("STEP 3")
     # STEP 3: Forward model (GPU)
     tec_true_hf, vtec_hf_gpu, delta_t_hf_gpu = forward_model_gpu(
         iono=iono,
         lats=lats,
-        alts_m=alt_km*1e3,
+        alts_m=alts_m,
         D_hf=D_hf,
-        theta_per_ray=incidence_angle_deg,
-        integ_hf=integ_hf
+        theta_per_ray=theta_per_ray,
+        integ_hf=integ_hf_per_ray
     )
 
-    # STEP 4: RECONSTRUCTION 
+    print("STEP 4")
+    # STEP 4: RECONSTRUCTION (STEP 5 & 4B)
     Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, D_all, vtec_all = step5_reconstruct(
         D_vhf, D_hf, vtec_vhf, vtec_hf, delta_t_vhf, delta_t_hf, lats, alts_m,
         n_iters=N_ITERS, relax=RELAX
     )
-
+    print("STEP 4A")
     vtec_all = np.concatenate([vtec_vhf, vtec_hf]).astype(float)
-
     Ne_rec_all_hist, rmse_hist_unw, reg_hist_unw = art_with_history(
         D_all, vtec_all,
         n_lat=len(lats), n_alt=len(alts_m),
         n_iters=N_ITERS, relax=RELAX,
-        compute_lcurve=True, L=None   # set L later if you add a regularizer
+        compute_lcurve=True, L=None
     )
-
-    # Ne_rec_all_hist, rmse_hist_unw, reg_hist_unw = sirt_cimmino_with_history(
-    #     D_all, vtec_all, n_lat=len(lats), n_alt=len(alts_m),
-    #     n_iters=N_ITERS, relax=RELAX
-    # )
-
     # Step 4B (Weighted ART)
+    print("STEP 4B")
+    integ_vhf_arr = np.full(vtec_vhf.shape[0], float(integ_vhf), dtype=float)
     Ne_rec_weighted, weights = step4B_weighted_reconstruct(
-        D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_VHF, bw_hf=BW_HF,
+        D_all, vtec_all, integ_vhf_arr, integ_hf_per_ray, bw_vhf=BW_VHF, bw_hf=BW_HF,
         n_lat=len(lats), n_alt=len(alts_m), n_iters=50, relax=0.2
     )
 
@@ -583,6 +595,7 @@ def run_pipeline(s_no,
     if 'Ne_rec_hf' in locals():
         _print_ne_stats("Reconstructed Ne (HF ART)", Ne_rec_hf)
 
+    print("STEP 4C")
     Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
         D_all, vtec_all, weights,
         n_lat=len(lats), n_alt=len(alts_m),
@@ -590,7 +603,8 @@ def run_pipeline(s_no,
         compute_lcurve=True, L=None
     )
 
-    # Optional δ(Δt) branch (same behavior as your script)
+    print("STEP 4D")
+    # Delta (Δt) branch (same behavior as your script)
     Ne_rec_ddt = delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
                                  f_c_hf=F_C_HF, bw_hf=BW_HF,
                                  n_iters=N_ITERS, relax=RELAX)
@@ -616,60 +630,112 @@ if __name__ == '__main__':
     
     # Introduce relation between integration time and incidence angle for HF rays (T_i = ((2*max_altitude)/sc_vel)*tan(theta_i))
     # Constrain the integration time, incidence angle and sat_lats_hf points because of this
-    # Choose a total along-track length in km (same for all cases)
-    TOTAL_KM = 500.0    # example: 500 km transect for each case
-    LAT_START = -5.0
 
-    # Case 1: coarse angles
-    theta_grid_coarse = np.linspace(2, 20, 10)
+    TOTAL_LAT_DEG = 20.0   # degrees of latitude covered by the transect (e.g. -10..+10)
+    # Convert latitude span to along-track kilometers at satellite radius (R_EUROPA + SC_ALTITUDE)
+    r_s_km = (R_EUROPA / 1e3) + (SC_ALTITUDE / 1e3)
+    TOTAL_KM = (np.pi / 180.0) * r_s_km * TOTAL_LAT_DEG
+    print("Total transect length (km):", TOTAL_KM)
+    
+    # Start latitude is the left edge of the span (center the span around 0° by default)
+    LAT_START = -10
+    VHF_INTEG_TIME = 0.12  # seconds
+    VHF_resolution_km = (SC_VELOCITY * VHF_INTEG_TIME / 1e3) * (180.0/np.pi) / r_s_km  # degrees
+    print("VHF resolution (deg):", VHF_resolution_km)
+    SAT_LATS_VHF = np.arange(-10, 10, VHF_resolution_km)
 
-    # Case 2: finer angles
-    theta_grid_fine = np.linspace(2, 20, 25)
+    # # Case 1: coarse angles
+    # theta_grid_coarse = np.linspace(2, 20, 10)
 
-    # Build the transects (MODE A)
-    sat_lats_1, thetas_1, T_1 = plan_transect_fixed_length(
-        theta_grid_deg=theta_grid_coarse,
-        total_km=TOTAL_KM,
-        lat_start_deg=LAT_START,
-        R_E_km=R_EUROPA/1e3,       
-        h_km=SC_ALTITUDE/1e3,
-        v_km_s=SC_VELOCITY/1e3
-    )
+    # # Case 2: finer angles
+    # theta_grid_fine = np.linspace(2, 20, 25)
 
-    sat_lats_2, thetas_2, T_2 = plan_transect_fixed_length(
-        theta_grid_deg=theta_grid_fine,
-        total_km=TOTAL_KM,
-        lat_start_deg=LAT_START,
-        R_E_km=R_EUROPA/1e3,
-        h_km=SC_ALTITUDE/1e3,
-        v_km_s=SC_VELOCITY/1e3
-    )
+    # # Build the transects (MODE A)
+    # sat_lats_1, thetas_1, T_1 = plan_transect_fixed_length(
+    #     theta_grid_deg=theta_grid_coarse,
+    #     total_km=TOTAL_KM,
+    #     lat_start_deg=LAT_START,
+    #     R_E_km=R_EUROPA/1e3,       
+    #     h_km=SC_ALTITUDE/1e3,
+    #     v_km_s=SC_VELOCITY/1e3
+    # )
 
-    # Feed into your pipeline — note: incidence_angle_deg and integ_hf now vary per shot
-    lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
-        s_no=1,
-        enhancement_amplitude=5e9,
-        sat_lats_vhf=np.linspace(-5.0, 5.0, 50),
-        npts_vhf=500,
-        sat_lats_hf=sat_lats_2,                 # <-- per-shot lats for the HF transect
-        incidence_angle_deg=thetas_2,           # <-- per-shot θ
-        npts_hf=500,
-        integ_vhf=0.12,
-        integ_hf=T_2                            # <-- per-shot Δt (same length as θ)
-    )
-    lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
-        s_no=3,
-        enhancement_amplitude=5e9,
-        sat_lats_vhf=np.linspace(-5.0, 5.0, 50),
-        npts_vhf=500,
-        sat_lats_hf=sat_lats_1,                 # <-- per-shot lats for the HF transect
-        incidence_angle_deg=thetas_1,           # <-- per-shot θ
-        npts_hf=500,
-        integ_vhf=0.12,
-        integ_hf=T_1                            # <-- per-shot Δt (same length as θ)
-    )
+    # print("Case 1: coarse angles")
+    # print("theta_grid_coarse:", theta_grid_coarse)
+    # print("T_1:", T_1)
+    # print("sat_lats_1:", sat_lats_1)
 
-    theta_grid = np.linspace(2, 20, 25)   # desired N
+    # sat_lats_2, thetas_2, T_2 = plan_transect_fixed_length(
+    #     theta_grid_deg=theta_grid_fine,
+    #     total_km=TOTAL_KM,
+    #     lat_start_deg=LAT_START,
+    #     R_E_km=R_EUROPA/1e3,
+    #     h_km=SC_ALTITUDE/1e3,
+    #     v_km_s=SC_VELOCITY/1e3
+    # )
+
+    # print("Case 2: fine angles")
+    # print("theta_grid_fine:", theta_grid_fine)
+    # print("T_2:", T_2)
+    # print("sat_lats_2:", sat_lats_2)
+
+    # # Feed into your pipeline — note: incidence_angle_deg and integ_hf now vary per shot
+    # lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
+    #     s_no=1,
+    #     enhancement_amplitude=5e9,
+    #     sat_lats_vhf=SAT_LATS_VHF,
+    #     npts_vhf=500,
+    #     sat_lats_hf=sat_lats_2,
+    #     incidence_angle_deg=thetas_2,
+    #     npts_hf=500,
+    #     integ_vhf=0.12,
+    #     integ_hf=T_2
+    # )
+    # lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
+    #     s_no=3,
+    #     enhancement_amplitude=5e9,
+    #     sat_lats_vhf=SAT_LATS_VHF,
+    #     npts_vhf=500,
+    #     sat_lats_hf=sat_lats_1,
+    #     incidence_angle_deg=thetas_1,
+    #     npts_hf=500,
+    #     integ_vhf=0.12,
+    #     integ_hf=T_1
+    # )
+
+    # ---- user-set knobs ----
+    ANGLES_TO_TEST = [0.05,0.1]
+    LAT_START      = -10.0
+
+    Rk = R_EUROPA/1e3
+    hk = SC_ALTITUDE/1e3
+    vk = SC_VELOCITY/1e3
+
+    for idx, th in enumerate(ANGLES_TO_TEST, 1):
+        # Build a fixed-length flight line with the *same* theta for every shot
+        sat_lats_hf, theta_per_ray, integ_hf_per_ray = plan_transect_single_angle(
+            theta_deg=th, total_km=TOTAL_KM, lat_start_deg=LAT_START,
+            R_E_km=Rk, h_km=hk, v_km_s=vk, min_shots=2, clamp_last=True
+        )
+
+        # Run the full forward + invert pipeline
+        lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
+            s_no=idx,
+            enhancement_amplitude=5e9,
+            sat_lats_vhf=SAT_LATS_VHF,    # your existing VHF grid
+            npts_vhf=500,
+            sat_lats_hf=sat_lats_hf,      # N+1
+            incidence_angle_deg=theta_per_ray,   # length N
+            npts_hf=500,
+            integ_vhf=0.12,
+            integ_hf=integ_hf_per_ray      # length N
+        )
+
+        print(f"\n[θ={th:.1f}°] shots={len(theta_per_ray)}, "
+            f"T̄={np.mean(integ_hf_per_ray):.3f}s, lat span={sat_lats_hf[-1]-sat_lats_hf[0]:.3f}°")
+
+
+    theta_grid = np.linspace(2, 20, 25)
     theta_scaled, T_scaled = scale_angles_to_match_length(
         theta_grid_deg=theta_grid,
         total_km=TOTAL_KM,
@@ -677,42 +743,23 @@ if __name__ == '__main__':
         v_km_s=SC_VELOCITY/1e3
     )
 
-    # Now build SAT_LATS_HF from the per-shot times (so geometry matches motion)
-    def sat_lats_from_times(T_list, lat_start_deg, R_E_km, h_km, v_km_s):
-        r_s = R_E_km + h_km
-        d_km = v_km_s * np.asarray(T_list)
-        dphi = (d_km / r_s) * (180.0/np.pi)
-        lats = [lat_start_deg]
-        for step in dphi:
-            lats.append(lats[-1] + step)
-        return np.asarray(lats)
-
     sat_lats_sameN = sat_lats_from_times(
         T_scaled, lat_start_deg=LAT_START,
         R_E_km=R_EUROPA/1e3, h_km=SC_ALTITUDE/1e3, v_km_s=SC_VELOCITY/1e3
     )
 
-    # Run
     lats, alt_km, iono, D_all, vtec_vhf, vtec_hf, dt_vhf, dt_hf = run_pipeline(
-        s_no=2,
+        s_no=1,
         enhancement_amplitude=5e9,
-        sat_lats_vhf=np.linspace(-5.0, 5.0, 50),
+        sat_lats_vhf=SAT_LATS_VHF,
         npts_vhf=500,
-        sat_lats_hf=sat_lats_sameN,      # len = N+1
-        incidence_angle_deg=theta_scaled, # len = N
+        sat_lats_hf=sat_lats_sameN,
+        incidence_angle_deg=theta_scaled,
         npts_hf=500,
         integ_vhf=0.12,
-        integ_hf=T_scaled                 # len = N
+        integ_hf=T_scaled
     )
-
-    # run_pipeline(
-    #     s_no=1,
-    #     enhancement_amplitude=5e9,
-    #     sat_lats_vhf=np.linspace(-5.0, 5.0, 50),
-    #     npts_vhf=500,
-    #     sat_lats_hf=np.linspace(-5.0, 5.0, 50),
-    #     incidence_angle_deg=np.linspace(1, 20, 20),
-    #     npts_hf=500,
-    #     integ_vhf=0.12,
-    #     integ_hf=0.1 
-    # )
+    print("Case 1: scaled angles to match length and number of shots")
+    print("theta_scaled:", theta_scaled)
+    print("T_scaled:", T_scaled)
+    print("sat_lats_sameN:", sat_lats_sameN)

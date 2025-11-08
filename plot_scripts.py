@@ -13,18 +13,18 @@ def plot_ionosphere_and_enhancement(s_no, latitudes, altitude, ionosphere_map, e
     fig, axs = plt.subplots(1, 2, figsize=(16, 6))
 
     # Original ionosphere
-    c1 = axs[0].contourf(latitudes, altitude, ionosphere_map, levels=50, cmap='viridis')
+    c1 = axs[0].contourf(latitudes, altitude, ionosphere_map*1e-6, levels=50, cmap='viridis')
     axs[0].set_xlabel('Latitude (degrees)')
     axs[0].set_ylabel('Altitude (km)')
     axs[0].set_title('Original Electron Density (electrons/m³)')
-    fig.colorbar(c1, ax=axs[0], label='Electron Density')
+    fig.colorbar(c1, ax=axs[0], label='Electron Density (10^6 electrons/m³)')
 
     # Enhanced ionosphere
-    c2 = axs[1].contourf(latitudes, altitude, enhanced_ionosphere, levels=50, cmap='viridis')
+    c2 = axs[1].contourf(latitudes, altitude, enhanced_ionosphere*1e-6, levels=50, cmap='viridis')
     axs[1].set_xlabel('Latitude (degrees)')
     axs[1].set_ylabel('Altitude (km)')
     axs[1].set_title('Enhanced Electron Density (electrons/m³)')
-    fig.colorbar(c2, ax=axs[1], label='Electron Density')
+    fig.colorbar(c2, ax=axs[1], label='Electron Density (10^6 electrons/m³)')
 
     plt.tight_layout()
     # plt.show(block=False)
@@ -115,6 +115,14 @@ def plot_raypaths(s_no, lats, alts_m, rays_hf, theta_per_ray, rays_vhf,
     # plt.show(block=False)
     plt.savefig(os.path.join(IMG_DIR, f"B_gpu_raypaths_{s_no}.png"))
 
+def centers_to_edges(c):
+    c = np.asarray(c)
+    e = np.empty(c.size + 1, dtype=c.dtype)
+    e[1:-1] = 0.5*(c[1:] + c[:-1])
+    e[0]     = c[0] - 0.5*(c[1] - c[0])
+    e[-1]    = c[-1] + 0.5*(c[-1] - c[-2])
+    return e
+
 def plot_recons(s_no, lats, alts_m, recs, titles):
     fig, axs = plt.subplots(1, len(recs), figsize=(6*len(recs), 6), sharey=True)
     if len(recs) == 1: axs = [axs]
@@ -130,4 +138,43 @@ def plot_recons(s_no, lats, alts_m, recs, titles):
         if ax is axs[0]:
             ax.set_ylabel("Altitude (km)")
         fig.colorbar(im, ax=ax, label='Ne (×10⁶ cm⁻³)')
-    plt.tight_layout(); plt.show(block=False); plt.savefig(os.path.join(IMG_DIR, f"A_gpu_reconstructions_{s_no}.png"))
+    plt.tight_layout(); 
+    # plt.show(block=False); 
+    plt.savefig(os.path.join(IMG_DIR, f"C_gpu_reconstructions_{s_no}.png"))
+
+# Print detailed electron-density statistics to validate reconstruction
+def _print_ne_stats(label: str, arr):
+    try:
+        a = np.asarray(arr)
+        if a.size == 0:
+            print(f"{label}: empty array")
+            return
+        # Flatten safety: expect 2D arrays (n_alt x n_lat)
+        mn = float(np.min(a))
+        mx = float(np.max(a))
+        mean = float(np.mean(a))
+        med = float(np.median(a))
+        p25 = float(np.percentile(a, 25))
+        p75 = float(np.percentile(a, 75))
+
+        # Location of min/max (if 2D, map to alt/lat)
+        loc_min = None
+        loc_max = None
+        if a.ndim == 2 and 'lats' in locals() and 'alts_m' in locals():
+            i_min, j_min = np.unravel_index(int(np.argmin(a)), a.shape)
+            i_max, j_max = np.unravel_index(int(np.argmax(a)), a.shape)
+            lat_min = float(lats[j_min])
+            alt_min_m = float(alts_m[i_min])
+            lat_max = float(lats[j_max])
+            alt_max_m = float(alts_m[i_max])
+            loc_min = (i_min, j_min, alt_min_m, lat_min)
+            loc_max = (i_max, j_max, alt_max_m, lat_max)
+
+        print(f"{label}: min={mn:.3e}, p25={p25:.3e}, med={med:.3e}, mean={mean:.3e}, p75={p75:.3e}, max={mx:.3e}")
+        if loc_min is not None and loc_max is not None:
+            print(
+                f"{label} location min idx=(alt_idx={loc_min[0]}, lat_idx={loc_min[1]}) alt={loc_min[2]:.1f} m lat={loc_min[3]:.3f}°, "
+                f"max idx=(alt_idx={loc_max[0]}, lat_idx={loc_max[1]}) alt={loc_max[2]:.1f} m lat={loc_max[3]:.3f}°"
+            )
+    except Exception as e:
+        print(f"{label}: <unavailable> (error: {e})")

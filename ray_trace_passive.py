@@ -390,29 +390,22 @@ def dualfreq_to_VTEC_old2(
         return VTEC
 
 def dualfreq_to_VTEC(
-    stec_slant: np.ndarray,  # from compute_STEC_along_path
-    f_c: float,              # center frequency [Hz]
-    bw: float,               # total bandwidth [Hz]
-    theta_deg: float,        # incidence angle [deg]
-    integration_time: float = 1.0,  # [s]
-    snr_linear: float = 10.0,       # linear SNR (power ratio, not dB)
+    stec_slant: np.ndarray,   # from compute_STEC_along_path
+    f_c: float,               # center frequency [Hz]
+    bw: float,                # total bandwidth [Hz]
+    theta_deg: float,         # incidence angle [deg]
+    integration_time: float = 1.0,   # [s]
+    snr_linear: float = 10.0,        # linear SNR (power ratio)
     return_deltat: bool = False
-) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+):
     """
-    Dual-frequency TEC estimate (Peters et al. Eq. 9):
-    1) f1 = f_c - bw/2, f2 = f_c + bw/2
-    2) Compute group delay difference: Δt = (C / c) · STEC · (1/f1² − 1/f2²)
-    3) Invert Eq. 9: TEC = (c · Δt / C) · [f1² f2² / (f2² − f1²)]
-    4) Verticalize via cos(theta)
-    Additive white Gaussian delay noise is simulated based on autocorrelation peak resolution.
-
-    Parameters:
-        snr_linear : power SNR for passive signal (default = 10)
-
-    Returns:
-        VTEC or (VTEC, Δt) depending on return_deltat
+    Dual-frequency TEC estimate (Peters et al. Eq. 9)
+      Δt = (C_IONO / C_LIGHT) * STEC * (1/f1^2 − 1/f2^2)
+      TEC = (C_LIGHT * Δt / C_IONO) * (f1^2 f2^2 / (f2^2 − f1^2))
+      VTEC = TEC * cos(theta)
+    Adds AWGN timing error ~ N(0, sigma_dt^2) with sigma_dt = 1/(2π·BW·sqrt(T)·SNR).
+    Accepts scalars or arrays for theta_deg and integration_time.
     """
-    # Use constants from physics_constants for a single source-of-truth
     C = C_IONO
     c = C_LIGHT
     f1 = f_c - bw / 2.0
@@ -422,24 +415,16 @@ def dualfreq_to_VTEC(
     theta_arr = np.broadcast_to(np.atleast_1d(theta_deg).astype(float), st.shape)
     Tint_arr  = np.broadcast_to(np.atleast_1d(integration_time).astype(float), st.shape)
 
-    # Step 1: group delay difference from slant TEC (forward model)
     inv_freq_diff = (1.0 / f1**2 - 1.0 / f2**2)
-    # delta_t = (C_IONO / C_LIGHT) * STEC * (1/f1^2 - 1/f2^2)
-    delta_t = (C / c) * stec_slant * inv_freq_diff
+    delta_t = (C / c) * st * inv_freq_diff
 
-    # Step 2: simulate timing error from matched filter theory (Appendix B)
-    sigma_dt  = 1.0 / (2 * np.pi * bw * np.sqrt(Tint_arr) * snr_linear)
-    delta_t  += np.random.normal(0.0, 1.0, size=st.shape) * sigma_dt
+    sigma_dt = 1.0 / (2.0 * np.pi * bw * np.sqrt(Tint_arr) * snr_linear)
+    delta_t  = delta_t + np.random.normal(0.0, 1.0, size=st.shape) * sigma_dt
 
-    # Step 3: TEC inversion (Eq. 9)
     freq_factor = (f1**2 * f2**2) / (f2**2 - f1**2)
-    # TEC inversion: TEC = (C_LIGHT * delta_t / C_IONO) * freq_factor
     TEC = (c * delta_t / C) * freq_factor
 
-    # Step 4: Verticalize to get VTEC
-    theta = np.deg2rad(theta_deg)
-    VTEC = TEC * np.cos(theta)
-
+    VTEC = TEC * np.cos(np.deg2rad(theta_arr))
     if return_deltat:
         return VTEC, delta_t
     else:

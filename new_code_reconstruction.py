@@ -8,6 +8,7 @@ import scipy.sparse as sp
 import os
 from datetime import datetime
 from physics_constants import C_LIGHT, C_IONO, R_EUROPA
+import gc
 
 from modify_df import load_mission_df
 from ionosphere_design import (
@@ -35,6 +36,18 @@ except Exception:
     USE_GPU = False
     cp = None
     cpx_sparse = None
+
+# Keep only minimal constants and thinning helper at top; full GPU/sparse helpers
+# are defined later in the file so they can rely on local imports and flags.
+MAX_ROWS_CHUNKED = 12000   # tune for your box
+
+MAX_HF_SHOTS = 8000  # tune; keeps CSR reasonable
+
+def thin_by_stride(items, max_keep):
+    if len(items) <= max_keep:
+        return items
+    stride = int(np.ceil(len(items) / max_keep))
+    return items[::stride]
 # ---------------------- Constants ----------------------
 
 # VHF & HF radio parameters
@@ -140,31 +153,23 @@ def generate_ray_paths(s_no, sat_lats_vhf, alts_m, npts_vhf,
         theta_per_ray = theta_rep
         integ_hf_per_ray = np.array(integ_rep, dtype=float)
 
+    # Thin HF rays to cap CSR size (prevents explosion for small theta)
+    rays_hf = thin_by_stride(rays_hf, MAX_HF_SHOTS)
+    theta_per_ray = np.asarray(theta_per_ray, float)[: len(rays_hf)]
+    integ_hf_per_ray = np.asarray(integ_hf_per_ray, float)[: len(rays_hf)]
+
     # Build Geometry Matrices
     # Use the latitude grid `lats` (not satellite lat arrays) so columns match ionosphere pixels
     D_vhf = build_geometry_matrix_weighted_sparse(rays_vhf, lats, alts_m, dtype=np.float32)
     D_hf  = build_geometry_matrix_weighted_sparse(rays_hf,  lats, alts_m, dtype=np.float32)
     D_all = scipy.sparse.vstack([D_vhf, D_hf], format="csr")
 
-    # HF path (GPU)
-    # Push ionosphere to GPU and validate shapes
-    iono_gpu = cp.asarray(iono, dtype=cp.float32)          # (n_alt, n_lat)
-    x_gpu = iono_gpu.ravel(order="C")                      # (n_pix,)
-    D_hf_gpu = cpx_sparse.csr_matrix(D_hf)
-    # Validate expected dimensions before calling cuSPARSE
-    n_rows, n_cols = D_hf.shape
-    if x_gpu.size != n_cols:
-        print(f"Dimension mismatch BEFORE GPU multiply: D_hf.shape={D_hf.shape}, x_gpu.shape={x_gpu.shape}")
-        raise ValueError(f"Geometry columns ({n_cols}) != ionosphere pixels ({x_gpu.size})")
-    # TEC truth (HF; GPU)
-    try:
-        tec_true_gpu = D_hf_gpu @ x_gpu                        # (N,)
-    except Exception:
-        print("Error during GPU sparse multiply:")
-        print(f" D_hf_gpu.shape = {D_hf_gpu.shape}, D_hf.dtype={D_hf.dtype}, nnz={D_hf.nnz}")
-        print(f" x_gpu.shape = {x_gpu.shape}, x_gpu.dtype={x_gpu.dtype}")
-        raise
-    tec_true = cp.asnumpy(tec_true_gpu)                    # back to CPU for helper
+    # HF path (chunked multiply to reduce GPU/CPU peak memory)
+    # Build a contiguous float32 true-ionosphere vector
+    x_true_vector = np.asarray(iono, dtype=np.float32).ravel(order="C")
+    tec_true = chunked_sparse_mv(D_hf, x_true_vector, rows_per_chunk=4000, use_gpu=USE_GPU, dtype=np.float32)
+    # immediately free to keep peak memory low
+    free_all_gpu(); gc.collect()
     # Integration times and angles per ray
     vtec_hf, delta_t_hf = dualfreq_to_VTEC(
         stec_slant=tec_true,
@@ -222,16 +227,10 @@ def forward_model_gpu(
 ):
     if not USE_GPU:
         raise RuntimeError("CuPy not available; use the CPU path or set USE_GPU=True.")
-    iono_gpu = cp.asarray(iono, dtype=cp.float32)
-    x_gpu = iono_gpu.ravel(order="C")
-    if hasattr(D_hf, "tocsr"):
-        D_hf_gpu = cpx_sparse.csr_matrix(D_hf)
-    else:
-        D_hf_gpu = cpx_sparse.csr_matrix(cp.asarray(D_hf))
-
-    # ---- TEC truth: one shot on GPU ----
-    tec_true_gpu = D_hf_gpu @ x_gpu                        # (N,)
-    tec_true = cp.asnumpy(tec_true_gpu)                    # back to CPU for helper
+    # Use the chunked sparse multiply to avoid building a full GPU matrix at once
+    x_true_vector = np.asarray(iono, dtype=np.float32).ravel(order="C")
+    tec_true = chunked_sparse_mv(D_hf, x_true_vector, rows_per_chunk=4000, use_gpu=True, dtype=np.float32)
+    free_all_gpu(); gc.collect()
 
     # ---- Convert to VTEC & Δt via your existing helper (vectorized & cheap) ----
     vtec_hf, delta_t_hf = dualfreq_to_VTEC(
@@ -253,26 +252,47 @@ def step5_reconstruct(D_vhf, D_hf, vtec_vhf, vtec_hf,
     n_lat, n_alt = len(lats), len(alts_m)
     # 5A) ART (VHF-only, HF-only, stacked)
     # VHF-only
-    if sp.issparse(D_vhf):
-        Ne_rec_vhf = reconstruct_art_sparse(D_vhf, vtec_vhf, n_lat, n_alt, n_iters, relax)
+    if sp.isspmatrix_csr(D_vhf) and D_vhf.shape[0] > MAX_ROWS_CHUNKED:
+        Ne_rec_vhf, _ = art_kaczmarz_chunked(
+            D_vhf, vtec_vhf, n_lat=n_lat, n_alt=n_alt,
+            n_iters=n_iters, relax=relax,
+            rows_per_chunk=4000, nonneg=True, dtype=np.float32
+        )
     else:
-        Ne_rec_vhf = reconstruct_art(D_vhf, vtec_vhf, n_lat, n_alt, n_iters, relax)
+        if sp.issparse(D_vhf):
+            Ne_rec_vhf = reconstruct_art_sparse(D_vhf, vtec_vhf, n_lat, n_alt, n_iters, relax)
+        else:
+            Ne_rec_vhf = reconstruct_art(D_vhf, vtec_vhf, n_lat, n_alt, n_iters, relax)
 
     # HF-only
-    if sp.issparse(D_hf):
-        Ne_rec_hf = reconstruct_art_sparse(D_hf, vtec_hf, n_lat, n_alt, n_iters, relax)
+    if sp.isspmatrix_csr(D_hf) and D_hf.shape[0] > MAX_ROWS_CHUNKED:
+        Ne_rec_hf, _ = art_kaczmarz_chunked(
+            D_hf, vtec_hf, n_lat=n_lat, n_alt=n_alt,
+            n_iters=n_iters, relax=relax,
+            rows_per_chunk=4000, nonneg=True, dtype=np.float32
+        )
     else:
-        Ne_rec_hf = reconstruct_art(D_hf, vtec_hf, n_lat, n_alt, n_iters, relax)
+        if sp.issparse(D_hf):
+            Ne_rec_hf = reconstruct_art_sparse(D_hf, vtec_hf, n_lat, n_alt, n_iters, relax)
+        else:
+            Ne_rec_hf = reconstruct_art(D_hf, vtec_hf, n_lat, n_alt, n_iters, relax)
 
     # Combined
     D_all = sp.vstack([D_vhf, D_hf], format="csr") if (sp.issparse(D_vhf) or sp.issparse(D_hf)) \
             else np.vstack([D_vhf, D_hf])
     vtec_all = np.concatenate([vtec_vhf, vtec_hf])
 
-    if sp.issparse(D_all):
-        Ne_rec_all = reconstruct_art_sparse(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
+    if sp.isspmatrix_csr(D_all) and D_all.shape[0] > MAX_ROWS_CHUNKED:
+        Ne_rec_all, _ = art_kaczmarz_chunked(
+            D_all, vtec_all, n_lat=n_lat, n_alt=n_alt,
+            n_iters=n_iters, relax=relax,
+            rows_per_chunk=4000, nonneg=True, dtype=np.float32
+        )
     else:
-        Ne_rec_all = reconstruct_art(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
+        if sp.issparse(D_all):
+            Ne_rec_all = reconstruct_art_sparse(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
+        else:
+            Ne_rec_all = reconstruct_art(D_all, vtec_all, n_lat, n_alt, n_iters, relax)
     return Ne_rec_vhf, Ne_rec_hf, Ne_rec_all, D_all, vtec_all
 
 def step4B_weighted_reconstruct(D_all, vtec_all, integ_vhf, integ_hf, bw_vhf=BW_VHF, bw_hf=BW_HF,
@@ -519,6 +539,137 @@ def delta_dt_branch(delta_t_vhf, delta_t_hf, D_hf, lats, alts_m,
                                     n_iters, relax)
     return Ne_rec_dt
 
+# ---------------------- HELPERS -----------------------
+
+# ======== GPU + Sparse Utilities (place after imports) ========
+
+import gc
+import numpy as np
+import scipy.sparse as sp
+
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sp
+    _HAS_CUPY = True
+except Exception:
+    _HAS_CUPY = False
+
+def free_all_gpu():
+    """Release CuPy memory pools (safe to call even if CuPy unavailable)."""
+    if _HAS_CUPY:
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+def chunked_sparse_mv(D_csr, x, rows_per_chunk=4000, use_gpu=True, dtype=np.float32):
+    """
+    y = D @ x computed in row-chunks. Works with CPU or GPU.
+    - D_csr: scipy.sparse.csr_matrix (float32 recommended)
+    - x: 1D numpy array
+    - rows_per_chunk: trade memory vs. speed
+    - use_gpu: if True and CuPy is available, use GPU per chunk
+    Returns numpy 1D array y.
+    """
+    assert sp.isspmatrix_csr(D_csr)
+    x = np.asarray(x, dtype=dtype)
+    m, n = D_csr.shape
+    y_out = np.empty(m, dtype=dtype)
+
+    if use_gpu and not _HAS_CUPY:
+        use_gpu = False
+
+    if use_gpu:
+        x_gpu = cp.asarray(x)
+    else:
+        x_gpu = None
+
+    for i0 in range(0, m, rows_per_chunk):
+        i1 = min(i0 + rows_per_chunk, m)
+        D_blk = D_csr[i0:i1].astype(dtype, copy=False)
+
+        if use_gpu:
+            Dg = cpx_sp.csr_matrix(D_blk)
+            yg = Dg @ x_gpu
+            y_out[i0:i1] = cp.asnumpy(yg)
+            del Dg, yg
+            free_all_gpu()
+        else:
+            y_out[i0:i1] = D_blk.dot(x)
+
+        # Drop CPU chunk ASAP
+        del D_blk
+        gc.collect()
+
+    if x_gpu is not None:
+        del x_gpu
+        free_all_gpu()
+
+    return y_out
+
+def csr_row_norm2(D):
+    """Row-wise ||row||^2 for CSR or dense."""
+    if sp.issparse(D):
+        return np.array(D.power(2).sum(axis=1)).ravel().astype(np.float32)
+    else:
+        return np.sum(D * D, axis=1).astype(np.float32)
+
+def art_kaczmarz_chunked(D_csr, y, *, n_lat, n_alt, n_iters=20, relax=0.1,
+                         rows_per_chunk=4000, nonneg=True, dtype=np.float32):
+    """
+    Matrix-chunked Kaczmarz ART: iterate row-by-row but only keep a small
+    CSR block in memory. Returns (x_map, rmse_hist).
+    - D_csr: scipy.sparse.csr_matrix
+    - y: numpy 1D
+    """
+    assert sp.isspmatrix_csr(D_csr)
+    y = np.asarray(y, dtype=dtype)
+    m, n = D_csr.shape
+    x = np.zeros(n, dtype=dtype)
+
+    for it in range(n_iters):
+        row_start = 0
+        while row_start < m:
+            row_end = min(row_start + rows_per_chunk, m)
+            Db = D_csr[row_start:row_end].astype(dtype, copy=False)
+            yb = y[row_start:row_end]
+            rn2 = csr_row_norm2(Db)
+            rn2[rn2 == 0.0] = 1.0
+
+            # Kaczmarz over rows in this block
+            indptr = Db.indptr
+            idxs   = Db.indices
+            vals   = Db.data
+            for i in range(row_end - row_start):
+                s = indptr[i]; e = indptr[i+1]
+                col = idxs[s:e]
+                dat = vals[s:e]
+                pred = float(np.dot(dat, x[col]))
+                ri = yb[i] - pred
+                alpha = relax * (ri / rn2[i])
+                x[col] += alpha * dat
+
+            del Db
+            gc.collect()
+            row_start = row_end
+
+        if nonneg:
+            np.maximum(x, 0, out=x)
+
+    # no big D present anymore, compute RMSE one final time in chunks:
+    rmse = _rmse_chunked(D_csr, x, y, rows_per_chunk=rows_per_chunk, dtype=dtype)
+    return x.reshape(n_alt, n_lat, order="C"), [rmse]
+
+def _rmse_chunked(D_csr, x, y, rows_per_chunk=4000, dtype=np.float32):
+    """RMSE(Dx, y) computed via chunked matvec (CPU)."""
+    yhat = chunked_sparse_mv(D_csr, x, rows_per_chunk=rows_per_chunk,
+                             use_gpu=False, dtype=dtype)
+    diff = (yhat - y).astype(dtype)
+    return float(np.sqrt(np.mean(diff * diff)))
+
+
+
 # ---------------------- MAIN PIPELINE ----------------------
 def run_pipeline(s_no,
                  enhancement_amplitude,
@@ -560,6 +711,8 @@ def run_pipeline(s_no,
         theta_per_ray=theta_per_ray,
         integ_hf=integ_hf_per_ray
     )
+    # keep memory low after big forward model
+    gc.collect(); free_all_gpu()
 
     print("STEP 4")
     # STEP 4: RECONSTRUCTION (STEP 5 & 4B)
@@ -569,12 +722,21 @@ def run_pipeline(s_no,
     )
     print("STEP 4A")
     vtec_all = np.concatenate([vtec_vhf, vtec_hf]).astype(float)
-    Ne_rec_all_hist, rmse_hist_unw, reg_hist_unw = art_with_history(
-        D_all, vtec_all,
-        n_lat=len(lats), n_alt=len(alts_m),
-        n_iters=N_ITERS, relax=RELAX,
-        compute_lcurve=True, L=None
-    )
+    if sp.isspmatrix_csr(D_all) and D_all.shape[0] > MAX_ROWS_CHUNKED:
+        Ne_rec_all_hist, rmse_hist_unw = art_kaczmarz_chunked(
+            D_all, vtec_all, n_lat=len(lats), n_alt=len(alts_m),
+            n_iters=N_ITERS, relax=RELAX,
+            rows_per_chunk=4000, nonneg=True, dtype=np.float32
+        )
+        reg_hist_unw = None
+    else:
+        Ne_rec_all_hist, rmse_hist_unw, reg_hist_unw = art_with_history(
+            D_all, vtec_all,
+            n_lat=len(lats), n_alt=len(alts_m),
+            n_iters=N_ITERS, relax=RELAX,
+            compute_lcurve=True, L=None
+        )
+    gc.collect(); free_all_gpu()
     # Step 4B (Weighted ART)
     print("STEP 4B")
     integ_vhf_arr = np.full(vtec_vhf.shape[0], float(integ_vhf), dtype=float)
@@ -596,12 +758,28 @@ def run_pipeline(s_no,
         _print_ne_stats("Reconstructed Ne (HF ART)", Ne_rec_hf)
 
     print("STEP 4C")
-    Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
-        D_all, vtec_all, weights,
-        n_lat=len(lats), n_alt=len(alts_m),
-        n_iters=N_ITERS, relax=RELAX,
-        compute_lcurve=True, L=None
-    )
+    # Weighted ART (use chunked ART if D_all is too tall)
+    if sp.isspmatrix_csr(D_all) and D_all.shape[0] > MAX_ROWS_CHUNKED:
+        sw = np.sqrt(np.maximum(weights, 0.0))
+        if sp.issparse(D_all):
+            Ds = D_all.multiply(sw[:, None])
+        else:
+            Ds = D_all * sw[:, None]
+        ys = vtec_all * sw
+        Ne_rec_weighted_hist, rmse_hist_w = art_kaczmarz_chunked(
+            Ds, ys, n_lat=len(lats), n_alt=len(alts_m),
+            n_iters=N_ITERS, relax=RELAX,
+            rows_per_chunk=4000, nonneg=True, dtype=np.float32
+        )
+        reg_hist_w = None
+    else:
+        Ne_rec_weighted_hist, rmse_hist_w, reg_hist_w = weighted_art_with_history(
+            D_all, vtec_all, weights,
+            n_lat=len(lats), n_alt=len(alts_m),
+            n_iters=N_ITERS, relax=RELAX,
+            compute_lcurve=True, L=None
+        )
+    gc.collect(); free_all_gpu()
 
     print("STEP 4D")
     # Delta (Δt) branch (same behavior as your script)
@@ -609,6 +787,7 @@ def run_pipeline(s_no,
                                  f_c_hf=F_C_HF, bw_hf=BW_HF,
                                  n_iters=N_ITERS, relax=RELAX)
     _print_ne_stats("Reconstructed Ne (delta_t branch)", Ne_rec_ddt if 'Ne_rec_ddt' in locals() else np.array([]))
+    gc.collect(); free_all_gpu()
 
     # Ensure arrays are (n_alt, n_lat) for cross-sections (transpose if yours are (n_lat,n_alt))
     truth_alt_lat = iono
